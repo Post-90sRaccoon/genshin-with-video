@@ -1,0 +1,10 @@
+/build/
+/dist/
+/third_party/
+/data/
+*.pdb
+*.user
+/review-materials/
+cookies*.txt
+.env
+.env.*

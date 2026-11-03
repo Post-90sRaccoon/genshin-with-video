@@ -1,0 +1,24 @@
+{
+  "mpv": {
+    "tag": "20261021",
+    "sha256": "efc719eff3dc5954b4a5efc800632808bcec01cc9034940dd14e5eb7fe9ea633",
+    "url": "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261021/mpv-dev-x86_64-20261021-git-e471496c56.7z",
+    "asset": "mpv-dev-x86_64-20261021-git-e471496c56.7z",
+    "dll_sha256": "04e4d27dc385dc18ddd93fbe69c75e635b864f3c6ec53a9122df54c2f7842f4a"
+  },
+  "yt_dlp": {
+    "tag": "2026.10.26",
+    "sha256": "f5389d3698ecde4ef06f4e6b1ce0294fe9ac1396228c8990b8d3416d6d177a7d",
+    "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.26/yt-dlp.exe"
+  },
+  "archiver": {
+    "version": "26.04",
+    "url": "https://www.7-zip.org/a/7zr.exe",
+    "sha256": "256feca8e274e5da655e2a284fabafd9f554365eb164862089dacd4e8276d282"
+  },
+  "json": {
+    "sha256": "9bea4c8066ef4a1c206b2be5a36302f8926f7fdc6087af5d20b417d0cf103ea6",
+    "version": "3.11.3",
+    "url": "https://raw.githubusercontent.com/nlohmann/json/v3.11.3/single_include/nlohmann/json.hpp"
+  }
+}
