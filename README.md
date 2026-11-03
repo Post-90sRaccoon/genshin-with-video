@@ -4,6 +4,17 @@ Windows x64 原生悬浮播放器。粘贴 B 站链接或 BV 号，选择分 P�
 
 当前状态：旧版 EXE 曾两次被 Defender 隔离。2026-11-01 已删除前端自制解析子进程管理代码，修正加载状态与恢复进度，新版通过离线回归、P2 的 720p/AAC 播放检查和 10 分钟运行采样；用户确认正式窗口画面和声音正常。本机专用工作集约 148–170 MiB。原神与小窗均以管理员权限运行后，用户确认游戏前台 F8、F9、F10 全部正常。独占全屏未单独验证。具体证据见 `docs/verification.md`，退出原因调查见 `docs/crash-investigation.md`。微软尚未确认误报。
 
+## 下载
+
+👉 [前往下载 Windows x64 便携版](https://github.com/Post-90sRaccoon/genshin-with-video/releases)
+
+进入发布页面，展开对应版本的 **Assets**，下载其中的 Windows x64 便携 ZIP 压缩包。
+
+**Source code (zip)** 和 **Source code (tar.gz)** 是源码包，不包含可直接运行的完整程序。
+
+下载后完整解压，打开文件夹中的 `GenshinVideo.exe`。
+如果游戏以管理员权限运行，请先退出小窗，再通过 `Start-GameMode.cmd` 启动。
+
 ## 使用
 
 打开 `dist/GenshinVideo/GenshinVideo.exe`，点击 **打开**。**选集**可切换路线，每个视频、每个 CID 分别保存进度。位置、尺寸和观看进度保存在程序旁的 `data` 文件夹。移动时请保留整个便携目录，目录需要可写。
