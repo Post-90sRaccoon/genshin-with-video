@@ -36,6 +36,8 @@ void Player::load_url(const std::string& url,double start,bool paused,const std:
 void Player::load_internal(const Media& media,double start,bool paused,const std::string& title,bool parse_url) {
     if(!handle_)throw std::runtime_error("播放器尚未初始化");
     drain();loaded_=false;error_.clear();expected_entry_=-1;
+    parse_url_=parse_url;source_deadline_=0;
+    if(!parse_url_)source_deadline_=extraction_deadline({{"requested_formats",json::array({{{"url",media.video}},{{"url",media.audio}}})}});
     std::vector<std::string> keys={"start","pause","force-media-title","ytdl"},values={std::to_string(start),paused?"yes":"no",title,parse_url?"yes":"no"};
     for(const auto& h:media.headers){if(h.first=="Referer"){keys.push_back("referrer");values.push_back(h.second);}else if(h.first=="User-Agent"){keys.push_back("user-agent");values.push_back(h.second);}else{keys.push_back("http-header-fields-append");values.push_back(h.first+": "+h.second);}}
     if(!media.audio.empty()){keys.push_back("audio-files-append");values.push_back(media.audio);}
@@ -53,7 +55,7 @@ void Player::load_internal(const Media& media,double start,bool paused,const std
     if(expected_entry_<0){stop();throw std::runtime_error("播放器未返回媒体条目标识，请检查 libmpv 版本");}
     trace_event("mpv-load-entry",expected_entry_);
 }
-void Player::stop(){expected_entry_=-1;loaded_=false;error_.clear();if(handle_){const char* args[]={"stop",nullptr};check(command_(handle_,args));}}
+void Player::stop(){expected_entry_=-1;loaded_=false;source_deadline_=0;error_.clear();if(handle_){const char* args[]={"stop",nullptr};check(command_(handle_,args));}}
 void Player::set_pause(bool paused){if(handle_){int b=paused?1:0;check(set_(handle_,"pause",MPV_FORMAT_FLAG,&b));}}
 void Player::seek(double delta){if(handle_){auto s=snapshot();if(!s.loaded || !s.position_valid)return;auto target=std::to_string(clamp_seek(s.position,delta,s.duration));const char* args[]={"seek",target.c_str(),"absolute+exact",nullptr};check(command_(handle_,args));}}
 void Player::volume(double value){if(handle_)check(set_(handle_,"volume",MPV_FORMAT_DOUBLE,&value));}
@@ -61,9 +63,19 @@ std::string Player::text(const char* property){char* p=string_(handle_,property)
 void Player::drain(){if(!handle_)return;while(auto e=event_(handle_,0)){
     if(e->event_id==MPV_EVENT_NONE)break;
     if(e->event_id==MPV_EVENT_START_FILE){auto start=static_cast<mpv_event_start_file*>(e->data);active_entry_=start?start->playlist_entry_id:-1;}
-    if(e->event_id==MPV_EVENT_FILE_LOADED && active_entry_==expected_entry_ && expected_entry_>=0){loaded_=true;error_.clear();}
+    if(e->event_id==MPV_EVENT_FILE_LOADED && active_entry_==expected_entry_ && expected_entry_>=0){
+        loaded_=true;error_.clear();
+        if(parse_url_){
+            auto result=json::parse(text("user-data/mpv/ytdl/json-subprocess-result"),nullptr,false);
+            if(result.is_object()){
+                auto output=result.find("stdout");
+                if(output!=result.end() && output->is_string())source_deadline_=extraction_deadline(json::parse(output->get<std::string>(),nullptr,false));
+            }
+        }
+        if(source_deadline_>0)trace_event("source-deadline",source_deadline_);
+    }
     if(e->event_id==MPV_EVENT_END_FILE){auto end=static_cast<mpv_event_end_file*>(e->data);if(end && end->playlist_entry_id==expected_entry_ && expected_entry_>=0){loaded_=false;if(end->reason==MPV_END_FILE_REASON_ERROR)error_=std::string("媒体连接失败：")+error_string_(end->error);}}
 }}
-Snapshot Player::snapshot(){Snapshot s;s.loaded=loaded_;s.error=error_;s.entry_id=expected_entry_;if(!handle_)return s;int value=1;get_(handle_,"pause",MPV_FORMAT_FLAG,&value);s.paused=value!=0;value=0;get_(handle_,"eof-reached",MPV_FORMAT_FLAG,&value);s.eof=value!=0;value=0;get_(handle_,"seeking",MPV_FORMAT_FLAG,&value);s.seeking=value!=0;s.position_status=get_(handle_,"time-pos",MPV_FORMAT_DOUBLE,&s.position);s.position_valid=s.loaded && s.position_status>=0 && std::isfinite(s.position) && s.position>=0;get_(handle_,"duration",MPV_FORMAT_DOUBLE,&s.duration);int64_t height=0;get_(handle_,"video-params/h",MPV_FORMAT_INT64,&height);s.height=static_cast<int>(height);s.audio_codec=text("audio-codec-name");s.hwdec=text("hwdec-current");return s;}
-void Player::shutdown(){if(handle_){if(callback_)callback_(handle_,nullptr,nullptr);if(destroy_)destroy_(handle_);handle_=nullptr;}wake_={};if(library_){FreeLibrary(library_);library_=nullptr;}loaded_=false;expected_entry_=active_entry_=-1;error_.clear();}
+Snapshot Player::snapshot(){Snapshot s;s.loaded=loaded_;s.error=error_;s.entry_id=expected_entry_;s.source_deadline=source_deadline_;if(!handle_)return s;int value=1;get_(handle_,"pause",MPV_FORMAT_FLAG,&value);s.paused=value!=0;value=0;get_(handle_,"eof-reached",MPV_FORMAT_FLAG,&value);s.eof=value!=0;value=0;get_(handle_,"seeking",MPV_FORMAT_FLAG,&value);s.seeking=value!=0;s.position_status=get_(handle_,"time-pos",MPV_FORMAT_DOUBLE,&s.position);s.position_valid=s.loaded && s.position_status>=0 && std::isfinite(s.position) && s.position>=0;get_(handle_,"duration",MPV_FORMAT_DOUBLE,&s.duration);int64_t height=0;get_(handle_,"video-params/h",MPV_FORMAT_INT64,&height);s.height=static_cast<int>(height);s.audio_codec=text("audio-codec-name");s.hwdec=text("hwdec-current");return s;}
+void Player::shutdown(){if(handle_){if(callback_)callback_(handle_,nullptr,nullptr);if(destroy_)destroy_(handle_);handle_=nullptr;}wake_={};if(library_){FreeLibrary(library_);library_=nullptr;}loaded_=false;source_deadline_=0;expected_entry_=active_entry_=-1;error_.clear();}
 }

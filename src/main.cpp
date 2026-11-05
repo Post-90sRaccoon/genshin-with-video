@@ -10,6 +10,7 @@
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
+#include <ctime>
 using namespace gv;
 namespace {
 constexpr UINT JOB_DONE=WM_APP+1,MEDIA_EVENT=WM_APP+2,TRAY_EVENT=WM_APP+3,SHOW_EXISTING=WM_APP+4;
@@ -27,6 +28,7 @@ public:
     std::atomic<bool> closing{false};unsigned generation=0;bool busy=false,desiredPaused=false,hidden=false,pass=false,modal=false,refreshUsed=false,applyIntentOnLoad=false,hadPlayback=false;
     std::array<bool,5> registered{};std::string message,lastError,storageWarning,hotkeyWarning;std::wstring status;Snapshot state;double lastPosition=0;int lastSave=0;
     UINT dpi=96;int top=34,bottom=25;std::array<HWND,5> buttons{};NOTIFYICONDATAW tray={};bool trayAdded=false;ULONGLONG loadStarted=0;
+    long long renewedDeadline=0;
     explicit App():store(executable_dir()+L"\\data"),settings(read_settings(store.data["settings"])) {storageWarning=store.warning;}
     ~App(){closing=true;for(auto& j:jobs)j->cancel->cancel();for(auto& j:jobs)if(j->thread.joinable())j->thread.join();if(font)DeleteObject(font);}
     int scale(int v) const{return MulDiv(v,dpi,96);}
@@ -59,7 +61,7 @@ public:
         save_safely();cancel_jobs();cleanup_jobs();
         if(start && guide && guide->bvid==ref.bvid){auto p=std::find_if(guide->parts.begin(),guide->parts.end(),[&](const Part& item){return item.page==ref.page;});if(p!=guide->parts.end()){store.remember(guide->bvid,p->cid,*start);try{store.save();}catch(const std::exception& e){storageWarning=e.what();}}}
         loadStarted=0;applyIntentOnLoad=false;
-        if(!refresh){refreshUsed=false;hadPlayback=false;}
+        if(!refresh){refreshUsed=false;hadPlayback=false;renewedDeadline=0;}
         if(!keep_pause)desiredPaused=false;
         if(hidden)desiredPaused=true;
         requested=ref;busy=true;lastError.clear();message="正在获取攻略与当前分 P…";state=Snapshot{};
@@ -102,9 +104,15 @@ public:
         cleanup_jobs();update_status();
     }
     void fail(const std::string& error){busy=false;loadStarted=0;applyIntentOnLoad=false;lastError=error;message=error;ShowWindow(video,SW_HIDE);update_status();InvalidateRect(window,nullptr,TRUE);}
+    bool renew_source(long long now){
+        if(busy || modal || hidden || desiredPaused || !lastError.empty() || !state.error.empty() || !state.loaded || !state.position_valid || state.paused || state.seeking || state.eof || requested.bvid.empty())return false;
+        if(state.source_deadline<=0 || state.source_deadline<=renewedDeadline || state.source_deadline-now>60)return false;
+        renewedDeadline=state.source_deadline;trace_event("source-renewal",renewedDeadline);
+        open(requested,true,true,{},RetrySource::Extractor);return true;
+    }
     void sync(){if(!player.initialized())return;player.drain();state=player.snapshot();if(state.loaded && state.position_valid && !busy){loadStarted=0;hadPlayback=true;lastPosition=state.position;if(applyIntentOnLoad){trace_event("file-loaded",state.height);player.set_pause(desiredPaused||hidden);applyIntentOnLoad=false;state=player.snapshot();}if(state.eof)desiredPaused=true;if(hidden && !state.paused){desiredPaused=true;player.set_pause(true);state=player.snapshot();}}if(loadStarted && (!state.loaded || !state.position_valid) && !busy && !modal && GetTickCount64()-loadStarted>45000){trace_event("load-timeout");loadStarted=0;if(!refreshUsed){refreshUsed=true;open(requested,true,true);}else{player.stop();fail("视频解析或连接超时，请右键手动重试");}return;}if(!state.error.empty() && !busy && !modal && !requested.bvid.empty()){
             if(!refreshUsed){refreshUsed=true;open(requested,true,true,{},hadPlayback?RetrySource::Extractor:RetrySource::PublicApi);return;}fail(state.error+"；请右键选择“重试当前分 P”");KillTimer(window,1);
-        }update_status();}
+        }if(renew_source(static_cast<long long>(std::time(nullptr))))return;update_status();}
     void timer(){sync();if(++lastSave>=10){lastSave=0;if(state.loaded && !state.paused)save_safely();}}
     void update_status(){
         std::wstring value;

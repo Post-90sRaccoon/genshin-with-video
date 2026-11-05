@@ -20,6 +20,30 @@ int main(){
         app.loadStarted=1;app.fail("failed request");
         expect(app.loadStarted==0,"a terminal failure cancels its load watchdog");
         app.lastError.clear();app.message.clear();
+        {
+            App renewal;renewal.window=host;renewal.video=app.video;
+            renewal.store=Store(executable_dir()+L"\\renewal-test-data");
+            renewal.guide=app.guide;renewal.requested={"BV1BMgj6MEz4",1,false,""};
+            renewal.lastPosition=42.5;renewal.desiredPaused=false;
+            renewal.state.loaded=true;renewal.state.position_valid=true;renewal.state.position=42.5;
+            renewal.state.source_deadline=1793856353;
+            renewal.state.paused=false;
+            expect(!renewal.renew_source(1793849200),"fresh signed streams must not interrupt playback");
+            renewal.state.paused=true;
+            expect(!renewal.renew_source(1793856400),"an expired paused stream waits until resume");
+            renewal.state.paused=false;renewal.modal=true;
+            expect(!renewal.renew_source(1793856400),"defer renewal while a picker is open");
+            renewal.modal=false;
+            expect(renewal.renew_source(1793856400) && renewal.busy,"resume after two hours must re-extract expired streams");
+            expect(!renewal.desiredPaused && !renewal.refreshUsed,"scheduled renewal preserves play intent and the error retry");
+            for(auto& job:renewal.jobs)if(job->thread.joinable())job->thread.join();
+            expect(renewal.results.size()==1 && renewal.results.front()->resume.seconds==42.5,"source renewal preserves the current CID and playhead");
+            renewal.busy=false;renewal.state.loaded=true;renewal.state.position_valid=true;renewal.state.paused=false;renewal.state.source_deadline=1793856353;
+            expect(!renewal.renew_source(1793856401),"a stale extractor result must not cause a reload loop");
+            renewal.state.source_deadline=1793863553;
+            expect(!renewal.renew_source(1793856401),"a newly renewed stream stays loaded");
+            expect(renewal.renew_source(1793863500),"long sessions can renew again before the next deadline");
+        }
         const auto wav=executable_dir()+L"\\controller-silence.wav";
         {std::ofstream file(wav,std::ios::binary);auto u32=[&](unsigned value){file.write(reinterpret_cast<const char*>(&value),4);};auto u16=[&](unsigned short value){file.write(reinterpret_cast<const char*>(&value),2);};file.write("RIFF",4);u32(480036);file.write("WAVEfmt ",8);u32(16);u16(1);u16(1);u32(8000);u32(16000);u16(2);u16(16);file.write("data",4);u32(480000);std::string silence(480000,0);file.write(silence.data(),silence.size());}
         app.player.initialize(app.video,executable_dir()+L"\\..\\third_party\\mpv\\libmpv-2.dll",[]{});app.player.volume(0);

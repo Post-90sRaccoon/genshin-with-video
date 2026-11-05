@@ -6,6 +6,8 @@ Windows x64 原生悬浮播放器。粘贴 B 站链接或 BV 号，选择分 P�
 
 ## 下载
 
+2026-11-05 本地修正：播放时自动更新即将到期的音视频地址，长时间暂停后继续播放会检查地址有效期，并保留进度。针对 15:55 画面冻结的调查与验证见 `docs/playback-freeze-investigation.md`。
+
 👉 [前往下载 Windows x64 便携版](https://github.com/Post-90sRaccoon/genshin-with-video/releases)
 
 进入发布页面，展开对应版本的 **Assets**，下载其中的 Windows x64 便携 ZIP 压缩包。
