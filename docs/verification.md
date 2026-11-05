@@ -1,5 +1,11 @@
 # 验证记录
 
+2026-11-05 上下边缘等比例缩放修复（`codex/fix-vertical-edge-resize`，从 `develop` 的 `ed281eb` 创建）：原先 `WM_SIZING` 只按宽度计算高度，会覆盖上下边缘的高度变化。现在上下边缘按高度反算宽度，左右边缘及四角沿用宽度驱动；按当前 DPI 扣除原生边框和顶部/底部信息区，保持实际视频区域 16:9。上下拖动时左侧固定，其他方向保留相对侧锚点，并同时遵守原有 330×230 的 DPI 缩放最小尺寸下限。
+
+- 新回归先在原实现失败：`FAIL dragging any resize edge changes video width with the requested scale`。修复后 `scripts/build.ps1 -ControllerOnly` 通过，包含四边/四角、放大/缩小、最小尺寸、负屏幕坐标、96/144/192 DPI、菜单栏显示/隐藏的 144 组几何场景；另将计算结果实际应用到 HWND，验证两种菜单状态下的视频客户区比例。
+- 30 项核心断言、离线存储/同步网络句柄集成、原有控制器与 libmpv 媒体回归，以及 `tests/diagnostics_tests.ps1` 全部通过。此次仅改主窗口控制器，核心和依赖对象未变；按 `scripts/build.ps1` 相同的 C++17/Win32 编译与链接参数增量编译正式程序成功。独立只读审阅未发现可操作缺陷。
+- 检测到旧版小窗仍在运行，因此未覆盖旧 EXE。修复版位于 `dist/GenshinVideo/GenshinVideo-resize-fix.exe`，与该目录共享依赖和数据；先退出旧进程，再打开修复版验证。build / dist 修复版 SHA256 均为 `7e02b91911ca5de25eb4b140a6a7dc932206498c06e6b200dffd39ab94b016dc`。本轮完成原生窗口消息和实际客户区验证，未执行人工鼠标拖动或游戏前台按键验收。
+
 2026-11-05 菜单栏显示切换（`codex/feature-hide-menu-bar`，从 `develop` 创建）：顶部按钮栏可通过全局 `Ctrl+Alt+M` 或小窗/托盘右键“显示菜单栏”切换，立即保存并在下次启动恢复。设置增加第九项可改快捷键；兼容五项、八项旧配置，保留自定义按键并消解新增默认键冲突。隐藏后保留底部信息，可拖动底部状态栏移动窗口。
 
 - 新增回归先在未实现版本出现预期失败：`FAIL hidden menu bar survives settings roundtrip`。

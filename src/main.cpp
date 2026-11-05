@@ -57,6 +57,20 @@ public:
         if(statusLabel)MoveWindow(statusLabel,scale(8),r.bottom-bottom,std::max<LONG>(1,r.right-scale(16)),bottom,TRUE);
         InvalidateRect(window,nullptr,FALSE);
     }
+    void constrain_size(UINT edge,RECT& rect){
+        RECT frame={};
+        AdjustWindowRectExForDpi(&frame,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_STYLE)),GetMenu(window)!=nullptr,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_EXSTYLE)),dpi);
+        int frameWidth=static_cast<int>(frame.right-frame.left),overhead=static_cast<int>(frame.bottom-frame.top)+top+bottom;
+        int minVideoHeight=std::max(1,scale(230)-overhead);
+        int minVideoWidth=std::max(scale(330)-frameWidth,MulDiv(minVideoHeight,16,9));
+        // Top/bottom drags supply height; side and corner drags supply width.
+        bool vertical=edge==WMSZ_TOP || edge==WMSZ_BOTTOM;
+        int proposed=vertical?MulDiv(rect.bottom-rect.top-overhead,16,9):static_cast<int>(rect.right-rect.left)-frameWidth;
+        int videoWidth=std::max(minVideoWidth,proposed);
+        int width=videoWidth+frameWidth,height=MulDiv(videoWidth,9,16)+overhead;
+        if(edge==WMSZ_LEFT || edge==WMSZ_TOPLEFT || edge==WMSZ_BOTTOMLEFT)rect.left=rect.right-width;else rect.right=rect.left+width;
+        if(edge==WMSZ_TOP || edge==WMSZ_TOPLEFT || edge==WMSZ_TOPRIGHT)rect.top=rect.bottom-height;else rect.bottom=rect.top+height;
+    }
     void unregister_keys(){for(int i=0;i<HOTKEY_COUNT;++i){UnregisterHotKey(window,500+i);registered[i]=false;}}
     void register_keys(){unregister_keys();std::wstring failed;for(int i=0;i<HOTKEY_COUNT;++i){registered[i]=RegisterHotKey(window,500+i,hotkey_modifiers(settings.hotkeys[i]),LOBYTE(settings.hotkeys[i]))!=FALSE;if(!registered[i]){if(!failed.empty())failed+=L"、";failed+=hotkey_name(settings.hotkeys[i]);}}if(!registered[0] && pass)set_pass(false);hotkeyWarning=failed.empty()?"":"快捷键被占用："+utf8(failed)+"；请在设置中更换";}
     void geometry(){if(!IsWindow(window))return;RECT r;GetWindowRect(window,&r);store.data["window"]={{"x",r.left},{"y",r.top},{"width",r.right-r.left},{"height",r.bottom-r.top}};}
@@ -218,7 +232,7 @@ LRESULT CALLBACK window_proc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){App* app=rein
         return hit;
     }
     case WM_GETMINMAXINFO:{auto p=reinterpret_cast<MINMAXINFO*>(l);p->ptMinTrackSize={app->scale(330),app->scale(230)};return 0;}
-    case WM_SIZING:{auto r=reinterpret_cast<RECT*>(l);int w2=r->right-r->left;int height=(w2*9)/16+app->top+app->bottom+GetSystemMetrics(SM_CYSIZEFRAME)*2;if(w==WMSZ_TOP || w==WMSZ_TOPLEFT || w==WMSZ_TOPRIGHT)r->top=r->bottom-height;else r->bottom=r->top+height;return TRUE;}
+    case WM_SIZING:app->constrain_size(static_cast<UINT>(w),*reinterpret_cast<RECT*>(l));return TRUE;
     case WM_EXITSIZEMOVE:app->save_safely();return 0;
     case WM_DPICHANGED:{app->dpi=HIWORD(w);app->bottom=app->scale(25);app->set_font();auto r=reinterpret_cast<RECT*>(l);SetWindowPos(hwnd,HWND_TOPMOST,r->left,r->top,r->right-r->left,r->bottom-r->top,SWP_NOACTIVATE);app->layout();return 0;}
     case WM_DISPLAYCHANGE:app->keep_on_screen();return 0;

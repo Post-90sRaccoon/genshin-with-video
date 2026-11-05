@@ -7,10 +7,59 @@
 #include <set>
 #include "../src/resource.h"
 static void expect(bool value,const char* name){if(!value)throw std::runtime_error(name);}
+static void resize_regressions(){
+    const DWORD style=WS_POPUP|WS_THICKFRAME,extended=WS_EX_NOACTIVATE|WS_EX_APPWINDOW;
+    HWND ui=CreateWindowExW(extended,L"STATIC",L"Resize fixture",style,0,0,640,480,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+    expect(ui!=nullptr,"resize fixture window");
+    App sizing;sizing.window=ui;sizing.settings=Settings{};
+    SetWindowLongPtrW(ui,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&sizing));
+    for(UINT dpi:{96u,144u,192u})for(bool menuVisible:{true,false}){
+        sizing.dpi=dpi;sizing.settings.menu_bar_visible=menuVisible;sizing.top=menuVisible?sizing.scale(34):0;sizing.bottom=sizing.scale(25);
+        RECT base={0,0,sizing.scale(640),sizing.scale(360)+sizing.top+sizing.bottom};
+        expect(AdjustWindowRectExForDpi(&base,style,FALSE,extended,dpi)!=FALSE,"DPI-aware fixture frame");
+        const LONG frameWidth=base.right-base.left-sizing.scale(640),overhead=base.bottom-base.top-sizing.scale(360);
+        OffsetRect(&base,-1600-base.left,200-base.top);
+        for(UINT edge:{WMSZ_TOP,WMSZ_BOTTOM,WMSZ_LEFT,WMSZ_RIGHT,WMSZ_TOPLEFT,WMSZ_TOPRIGHT,WMSZ_BOTTOMLEFT,WMSZ_BOTTOMRIGHT}){
+            const bool vertical=edge==WMSZ_TOP || edge==WMSZ_BOTTOM;
+            const bool left=edge==WMSZ_LEFT || edge==WMSZ_TOPLEFT || edge==WMSZ_BOTTOMLEFT;
+            const bool upper=edge==WMSZ_TOP || edge==WMSZ_TOPLEFT || edge==WMSZ_TOPRIGHT;
+            const bool lower=edge==WMSZ_BOTTOM || edge==WMSZ_BOTTOMLEFT || edge==WMSZ_BOTTOMRIGHT;
+            for(int direction:{1,-1}){
+                RECT proposed=base;LONG dx=sizing.scale(160)*direction,dy=sizing.scale(90)*direction;
+                if(!vertical){if(left)proposed.left-=dx;else proposed.right+=dx;}
+                if(upper)proposed.top-=dy;else if(lower)proposed.bottom+=dy;
+                expect(window_proc(ui,WM_SIZING,edge,reinterpret_cast<LPARAM>(&proposed))==TRUE,"resize message is handled");
+                expect(proposed.right-proposed.left-frameWidth==sizing.scale(640+160*direction),"dragging any resize edge changes video width with the requested scale");
+                expect(proposed.bottom-proposed.top-overhead==sizing.scale(360+90*direction),"all edges and corners preserve the video aspect including native frame and menu strips");
+                expect((left?proposed.right==base.right:proposed.left==base.left) && (upper?proposed.bottom==base.bottom:proposed.top==base.top),"resizing keeps the opposite edges anchored at negative screen coordinates");
+            }
+            RECT tiny=base;
+            if(!vertical){if(left)tiny.left=tiny.right-1;else tiny.right=tiny.left+1;}
+            if(upper)tiny.top=tiny.bottom-1;else if(lower)tiny.bottom=tiny.top+1;
+            window_proc(ui,WM_SIZING,edge,reinterpret_cast<LPARAM>(&tiny));
+            expect(tiny.right-tiny.left>=sizing.scale(330) && tiny.bottom-tiny.top>=sizing.scale(230),"aspect correction respects both existing minimum dimensions");
+            LONG videoWidth=tiny.right-tiny.left-frameWidth,videoHeight=tiny.bottom-tiny.top-overhead;
+            expect(videoWidth>0 && videoHeight>0 && std::abs(videoWidth*9-videoHeight*16)<=8,"minimum-size video remains 16:9 within half a pixel of rounding");
+            expect((left?tiny.right==base.right:tiny.left==base.left) && (upper?tiny.bottom==base.bottom:tiny.top==base.top),"minimum-size clamping preserves the stationary edges");
+        }
+    }
+    sizing.dpi=GetDpiForWindow(ui);sizing.bottom=sizing.scale(25);
+    sizing.video=CreateWindowExW(0,L"STATIC",L"",WS_CHILD,0,0,1,1,ui,nullptr,GetModuleHandleW(nullptr),nullptr);
+    for(bool menuVisible:{true,false}){
+        sizing.settings.menu_bar_visible=menuVisible;sizing.layout();
+        RECT proposed={-1500,200,-860,700};window_proc(ui,WM_SIZING,WMSZ_TOP,reinterpret_cast<LPARAM>(&proposed));
+        SetWindowPos(ui,nullptr,proposed.left,proposed.top,proposed.right-proposed.left,proposed.bottom-proposed.top,SWP_NOZORDER|SWP_NOACTIVATE);sizing.layout();
+        RECT video;GetClientRect(sizing.video,&video);
+        expect(std::abs(video.right*9-video.bottom*16)<=8,"applying a constrained resize produces an actual 16:9 video client area");
+    }
+    SetWindowLongPtrW(ui,GWLP_USERDATA,0);DestroyWindow(ui);
+    std::cout<<"PASS edge/corner resize, minimum bounds and DPI/menu variants\n";
+}
 int main(){
     INITCOMMONCONTROLSEX controls={sizeof(controls),ICC_STANDARD_CLASSES|ICC_WIN95_CLASSES};InitCommonControlsEx(&controls);
     HWND host=CreateWindowExW(0,L"STATIC",L"Controller test",WS_POPUP,0,0,480,320,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
     try{
+        resize_regressions();
         expect(write_settings(read_settings({{"menu_bar_visible",false}})).value("menu_bar_visible",true)==false,"hidden menu bar survives settings roundtrip");
         expect(write_settings(read_settings(json::object())).value("menu_bar_visible",false),"legacy settings show the menu bar by default");
         for(const json& bad:std::vector<json>{nullptr,"false",0,1,json::array(),json::object()}){
