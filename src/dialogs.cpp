@@ -10,9 +10,10 @@ Settings read_settings(const json& data) {
         if(data.contains("quality") && data["quality"].is_number_integer()){int q=data["quality"].get<int>();if(q==360 || q==480 || q==720)s.quality=q;}
         if(data.contains("volume") && data["volume"].is_number_integer())s.volume=std::clamp(data["volume"].get<int>(),0,100);
         if(data.contains("speed") && data["speed"].is_number()){double speed=data["speed"].get<double>();if(valid_playback_speed(speed))s.speed=speed;}
+        if(data.contains("menu_bar_visible") && data["menu_bar_visible"].is_boolean())s.menu_bar_visible=data["menu_bar_visible"].get<bool>();
         if(data.contains("cookies") && data["cookies"].is_string())s.cookies=wide(data["cookies"].get<std::string>());
         auto stored=data.find("hotkeys");
-        if(stored!=data.end() && stored->is_array() && (stored->size()==5 || stored->size()==s.hotkeys.size())){
+        if(stored!=data.end() && stored->is_array() && (stored->size()==5 || stored->size()==8 || stored->size()==s.hotkeys.size())){
             std::set<WORD> unique;auto keys=s.hotkeys;bool valid=true;
             for(size_t i=0;i<stored->size();++i){
                 if(!(*stored)[i].is_number_integer()){valid=false;break;}
@@ -34,7 +35,7 @@ Settings read_settings(const json& data) {
         }
     }catch(...){}return s;
 }
-json write_settings(const Settings& s){return {{"quality",s.quality},{"volume",s.volume},{"speed",s.speed},{"cookies",utf8(s.cookies)},{"hotkeys",s.hotkeys}};}
+json write_settings(const Settings& s){return {{"quality",s.quality},{"volume",s.volume},{"speed",s.speed},{"menu_bar_visible",s.menu_bar_visible},{"cookies",utf8(s.cookies)},{"hotkeys",s.hotkeys}};}
 UINT hotkey_modifiers(WORD key){BYTE m=HIBYTE(key);return MOD_NOREPEAT|((m&HOTKEYF_ALT)?MOD_ALT:0)|((m&HOTKEYF_CONTROL)?MOD_CONTROL:0)|((m&HOTKEYF_SHIFT)?MOD_SHIFT:0);}
 std::wstring hotkey_name(WORD key){std::wstring r;BYTE m=HIBYTE(key);if(m&HOTKEYF_CONTROL)r+=L"Ctrl+";if(m&HOTKEYF_ALT)r+=L"Alt+";if(m&HOTKEYF_SHIFT)r+=L"Shift+";wchar_t name[128]={};GetKeyNameTextW(static_cast<LONG>(MapVirtualKeyW(LOBYTE(key),MAPVK_VK_TO_VSC)<<16),name,128);return r+name;}
 struct OpenContext {std::string value;};

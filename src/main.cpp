@@ -15,7 +15,7 @@ using namespace gv;
 namespace {
 constexpr UINT JOB_DONE=WM_APP+1,MEDIA_EVENT=WM_APP+2,TRAY_EVENT=WM_APP+3,SHOW_EXISTING=WM_APP+4;
 const UINT TASKBAR_CREATED=RegisterWindowMessageW(L"TaskbarCreated");
-enum Command { OPEN=100,PARTS,SETTINGS,HIDE,PAUSE,PREVIOUS,NEXT,RETRY,FROM_START,PASS_THROUGH,QUIT,SPEED };
+enum Command { OPEN=100,PARTS,SETTINGS,HIDE,PAUSE,PREVIOUS,NEXT,RETRY,FROM_START,PASS_THROUGH,QUIT,SPEED,MENU_BAR };
 constexpr int SPEED_FIRST=200;
 enum class RetrySource { Extractor,PublicApi };
 struct Result {unsigned generation=0;VideoRef ref;std::shared_ptr<Guide> guide;Resume resume;Media media;bool public_streams=false;std::string error;};
@@ -36,7 +36,7 @@ public:
     int scale(int v) const{return MulDiv(v,dpi,96);}
     void set_font(){if(font)DeleteObject(font);font=CreateFontW(-scale(13),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei UI");for(auto b:buttons)if(b)SendMessageW(b,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);if(statusLabel)SendMessageW(statusLabel,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);}
     void init(){
-        dpi=GetDpiForWindow(window);top=scale(34);bottom=scale(25);set_font();
+        dpi=GetDpiForWindow(window);top=settings.menu_bar_visible?scale(34):0;bottom=scale(25);set_font();
         video=CreateWindowExW(0,L"STATIC",L"",WS_CHILD|WS_CLIPCHILDREN|WS_CLIPSIBLINGS,0,top,480,270,window,nullptr,GetModuleHandleW(nullptr),nullptr);
         const wchar_t* labels[]={L"打开",L"选集",L"设置",L"隐藏",L"播放",L"1×"};int ids[]={OPEN,PARTS,SETTINGS,HIDE,PAUSE,SPEED};
         for(size_t i=0;i<buttons.size();++i)buttons[i]=CreateWindowExW(0,L"BUTTON",labels[i],WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,0,0,0,0,window,reinterpret_cast<HMENU>(static_cast<INT_PTR>(ids[i])),GetModuleHandleW(nullptr),nullptr);
@@ -49,7 +49,14 @@ public:
     void add_tray(){tray.cbSize=sizeof(tray);tray.hWnd=window;tray.uID=1;tray.uFlags=NIF_MESSAGE|NIF_ICON|NIF_TIP;tray.uCallbackMessage=TRAY_EVENT;tray.hIcon=LoadIconW(nullptr,IDI_APPLICATION);wcscpy_s(tray.szTip,L"原神攻略小窗 · 右键控制 / 显示窗口");trayAdded=Shell_NotifyIconW(NIM_ADD,&tray)!=FALSE;if(hidden && !trayAdded && !registered[1])show_existing();}
     void show_existing(){if(hidden)toggle_hidden();if(pass)set_pass(false);ShowWindow(window,SW_SHOWNOACTIVATE);SetWindowPos(window,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW);}
     void keep_on_screen(){RECT r;if(!GetWindowRect(window,&r))return;MONITORINFO info={sizeof(info)};if(!GetMonitorInfoW(MonitorFromRect(&r,MONITOR_DEFAULTTONEAREST),&info))return;int width=std::min(r.right-r.left,info.rcWork.right-info.rcWork.left),height=std::min(r.bottom-r.top,info.rcWork.bottom-info.rcWork.top);int x=std::clamp<LONG>(r.left,info.rcWork.left,info.rcWork.right-width),y=std::clamp<LONG>(r.top,info.rcWork.top,info.rcWork.bottom-height);SetWindowPos(window,HWND_TOPMOST,x,y,width,height,SWP_NOACTIVATE);}
-    void layout(){RECT r;GetClientRect(window,&r);int x=scale(18),gap=scale(4),width=std::min(scale(55),std::max(1,(static_cast<int>(r.right)-scale(26)-gap*5)/6));for(auto b:buttons){MoveWindow(b,x,scale(4),width,top-scale(8),TRUE);x+=width+gap;}if(video)MoveWindow(video,0,top,r.right,std::max<LONG>(1,r.bottom-top-bottom),TRUE);if(statusLabel)MoveWindow(statusLabel,scale(8),r.bottom-bottom,std::max<LONG>(1,r.right-scale(16)),bottom,TRUE);InvalidateRect(window,nullptr,FALSE);}
+    void layout(){
+        top=settings.menu_bar_visible?scale(34):0;
+        RECT r;GetClientRect(window,&r);int x=scale(18),gap=scale(4),width=std::min(scale(55),std::max(1,(static_cast<int>(r.right)-scale(26)-gap*5)/6));
+        for(auto b:buttons){if(b){MoveWindow(b,x,scale(4),width,scale(26),TRUE);ShowWindow(b,settings.menu_bar_visible?SW_SHOWNOACTIVATE:SW_HIDE);}x+=width+gap;}
+        if(video)MoveWindow(video,0,top,r.right,std::max<LONG>(1,r.bottom-top-bottom),TRUE);
+        if(statusLabel)MoveWindow(statusLabel,scale(8),r.bottom-bottom,std::max<LONG>(1,r.right-scale(16)),bottom,TRUE);
+        InvalidateRect(window,nullptr,FALSE);
+    }
     void unregister_keys(){for(int i=0;i<HOTKEY_COUNT;++i){UnregisterHotKey(window,500+i);registered[i]=false;}}
     void register_keys(){unregister_keys();std::wstring failed;for(int i=0;i<HOTKEY_COUNT;++i){registered[i]=RegisterHotKey(window,500+i,hotkey_modifiers(settings.hotkeys[i]),LOBYTE(settings.hotkeys[i]))!=FALSE;if(!registered[i]){if(!failed.empty())failed+=L"、";failed+=hotkey_name(settings.hotkeys[i]);}}if(!registered[0] && pass)set_pass(false);hotkeyWarning=failed.empty()?"":"快捷键被占用："+utf8(failed)+"；请在设置中更换";}
     void geometry(){if(!IsWindow(window))return;RECT r;GetWindowRect(window,&r);store.data["window"]={{"x",r.left},{"y",r.top},{"width",r.right-r.left},{"height",r.bottom-r.top}};}
@@ -122,7 +129,7 @@ public:
         else if(!lastError.empty())value=wide(lastError);
         else if(guide && !state.loaded && applyIntentOnLoad)value=L"P"+std::to_wstring(guide->parts[index].page)+L" · 正在解析和加载视频…";
         else if(guide){const auto& p=guide->parts.at(index);value=L"P"+std::to_wstring(p.page)+L"/"+std::to_wstring(guide->parts.size())+L"  ·  "+std::to_wstring(state.height)+L"p  ·  "+speed_text(settings.speed)+L"  ·  "+clock_text(state.loaded && state.position_valid?state.position:lastPosition)+L" / "+clock_text(state.duration>0?state.duration:p.duration)+L"  ·  "+(state.paused?L"已暂停":L"播放中");if(pass)value+=L"  ·  鼠标穿透";}
-        else value=message.empty()?L"打开 B 站链接开始  ·  可拖动上方空白处移动":wide(message);
+        else value=message.empty()?(settings.menu_bar_visible?L"打开 B 站链接开始  ·  可拖动上方空白处移动":L"右键打开 B 站链接  ·  可拖动底部状态栏移动"):wide(message);
         if(guide && !busy && lastError.empty() && !message.empty())value+=L"  ·  "+wide(message);
         if(!hotkeyWarning.empty())value=wide(hotkeyWarning);
         if(!storageWarning.empty())value=wide(storageWarning);
@@ -133,6 +140,7 @@ public:
     }
     void set_pass(bool enabled){if(enabled && !registered[0]){MessageBoxW(window,L"鼠标穿透解除热键被其他程序占用。请先在设置里更换该热键。",L"需要可用的解除热键",MB_OK|MB_ICONINFORMATION);return;}pass=enabled;LONG_PTR style=GetWindowLongPtrW(window,GWL_EXSTYLE);if(enabled){style|=WS_EX_TRANSPARENT|WS_EX_LAYERED;SetWindowLongPtrW(window,GWL_EXSTYLE,style);SetLayeredWindowAttributes(window,0,255,LWA_ALPHA);}else{style&=~(WS_EX_TRANSPARENT|WS_EX_LAYERED);SetWindowLongPtrW(window,GWL_EXSTYLE,style);}SetWindowPos(window,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_FRAMECHANGED);update_status();}
     void toggle_hidden(){if(!hidden){if(!registered[1] && !trayAdded){MessageBoxW(window,L"显示热键被占用，且托盘图标不可用。请先更换显示热键。",L"无法安全隐藏",MB_OK);return;}desiredPaused=true;player.set_pause(true);sync();save_safely();hidden=true;ShowWindow(window,SW_HIDE);}else{hidden=false;desiredPaused=true;player.set_pause(true);ShowWindow(window,SW_SHOWNOACTIVATE);SetWindowPos(window,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);sync();}update_status();}
+    void toggle_menu_bar(){settings.menu_bar_visible=!settings.menu_bar_visible;layout();save_safely();}
     void pause(){if(hidden)return;desiredPaused=!desiredPaused;trace_event("pause-request",desiredPaused?1:0);if(!busy && player.initialized()){player.set_pause(desiredPaused);sync();save_safely();}update_status();}
     void set_speed(double value){player.set_speed(value);settings.speed=value;if(player.initialized())state=player.snapshot();save_safely();}
     void step_speed(int delta){
@@ -167,6 +175,7 @@ public:
         if(modal || closing)return;
         if(id>=SPEED_FIRST && id<SPEED_FIRST+static_cast<int>(PLAYBACK_SPEEDS.size())){set_speed(PLAYBACK_SPEEDS[id-SPEED_FIRST]);return;}
         if(id==SPEED){show_speed_menu();return;}
+        if(id==MENU_BAR){toggle_menu_bar();return;}
         if(id==PAUSE){pause();return;}if(id==HIDE){toggle_hidden();return;}if(id==PASS_THROUGH){set_pass(!pass);return;}if(id==PREVIOUS){next(-1);return;}if(id==NEXT){next(1);return;}if(id==QUIT){PostMessageW(window,WM_CLOSE,0,0);return;}
         if(id==RETRY){if(!requested.bvid.empty() || requested.short_url)open(requested,true);return;}
         if(id==FROM_START){if(guide && !busy)open(requested,true,false,0.0);return;}
@@ -181,8 +190,16 @@ public:
         if(part && guide && *part<guide->parts.size()){VideoRef ref{guide->bvid,guide->parts[*part].page,false,""};open(ref,true);}
         accept_results();sync();
     }
-    void menu(POINT point){HWND previous=GetForegroundWindow();HMENU menu=CreatePopupMenu();auto add=[&](int id,const wchar_t* label,bool enabled=true,bool checked=false){AppendMenuW(menu,MF_STRING|(enabled?0:MF_GRAYED)|(checked?MF_CHECKED:0),id,label);};add(OPEN,L"打开 B 站链接…");add(PARTS,L"选择分 P…",guide!=nullptr);AppendMenuW(menu,MF_SEPARATOR,0,nullptr);add(PAUSE,desiredPaused?L"继续播放":L"暂停",guide!=nullptr || busy);AppendMenuW(menu,MF_POPUP,reinterpret_cast<UINT_PTR>(speed_menu()),L"播放速度");add(PREVIOUS,L"上一 P",guide && index>0 && !busy);add(NEXT,L"下一 P",guide && index+1<guide->parts.size() && !busy);add(FROM_START,L"当前 P 从头播放",guide!=nullptr && !busy);add(RETRY,L"重试当前分 P",!requested.bvid.empty() || requested.short_url);AppendMenuW(menu,MF_SEPARATOR,0,nullptr);add(PASS_THROUGH,L"鼠标穿透（快捷键可解除）",true,pass);add(HIDE,hidden?L"显示小窗（保持暂停）":L"隐藏并暂停");add(SETTINGS,L"设置 / 快捷键…");AppendMenuW(menu,MF_SEPARATOR,0,nullptr);add(QUIT,L"退出");SetForegroundWindow(window);int id=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,point.x,point.y,0,window,nullptr);DestroyMenu(menu);PostMessageW(window,WM_NULL,0,0);if(previous && previous!=window && IsWindow(previous))SetForegroundWindow(previous);if(id)command(id);}
-    void paint(){PAINTSTRUCT p;HDC dc=BeginPaint(window,&p);RECT r;GetClientRect(window,&r);HBRUSH bg=CreateSolidBrush(RGB(21,25,31));FillRect(dc,&r,bg);DeleteObject(bg);SetBkMode(dc,TRANSPARENT);SelectObject(dc,font);SetTextColor(dc,RGB(183,194,204));RECT grip={scale(4),0,scale(18),top};DrawTextW(dc,L"⠿",-1,&grip,DT_CENTER|DT_VCENTER|DT_SINGLELINE);RECT s=r;s.top=r.bottom-bottom;s.left=scale(10);s.right-=scale(8);DrawTextW(dc,status.c_str(),-1,&s,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS);if(!player.initialized() || busy || !lastError.empty()){RECT body={scale(24),top+scale(18),r.right-scale(24),r.bottom-bottom-scale(10)};std::wstring text=busy?L"正在打开攻略…\n\n可以继续操作游戏，加载完成后开始播放。":!lastError.empty()?wide(lastError)+L"\n\n右键 → 重试当前分 P，或打开其他链接。":L"攻略就在游戏旁边\n\n打开 B 站链接，选择你的路线\n暂停、倒退、继续都可以用快捷键\n\n右键打开菜单 · 拖动上方空白处移动";DrawTextW(dc,text.c_str(),-1,&body,DT_CENTER|DT_WORDBREAK);}EndPaint(window,&p);}
+    HMENU context_menu(){
+        HMENU menu=CreatePopupMenu();auto add=[&](int id,const wchar_t* label,bool enabled=true,bool checked=false){AppendMenuW(menu,MF_STRING|(enabled?0:MF_GRAYED)|(checked?MF_CHECKED:0),id,label);};
+        add(OPEN,L"打开 B 站链接…");add(PARTS,L"选择分 P…",guide!=nullptr);AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
+        add(PAUSE,desiredPaused?L"继续播放":L"暂停",guide!=nullptr || busy);AppendMenuW(menu,MF_POPUP,reinterpret_cast<UINT_PTR>(speed_menu()),L"播放速度");
+        add(PREVIOUS,L"上一 P",guide && index>0 && !busy);add(NEXT,L"下一 P",guide && index+1<guide->parts.size() && !busy);add(FROM_START,L"当前 P 从头播放",guide!=nullptr && !busy);add(RETRY,L"重试当前分 P",!requested.bvid.empty() || requested.short_url);AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
+        auto menuLabel=L"显示菜单栏\t"+hotkey_name(settings.hotkeys[8]);add(MENU_BAR,menuLabel.c_str(),true,settings.menu_bar_visible);
+        add(PASS_THROUGH,L"鼠标穿透（快捷键可解除）",true,pass);add(HIDE,hidden?L"显示小窗（保持暂停）":L"隐藏并暂停");add(SETTINGS,L"设置 / 快捷键…");AppendMenuW(menu,MF_SEPARATOR,0,nullptr);add(QUIT,L"退出");return menu;
+    }
+    void menu(POINT point){HWND previous=GetForegroundWindow();HMENU menu=context_menu();SetForegroundWindow(window);int id=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,point.x,point.y,0,window,nullptr);DestroyMenu(menu);PostMessageW(window,WM_NULL,0,0);if(previous && previous!=window && IsWindow(previous))SetForegroundWindow(previous);if(id)command(id);}
+    void paint(){PAINTSTRUCT p;HDC dc=BeginPaint(window,&p);RECT r;GetClientRect(window,&r);HBRUSH bg=CreateSolidBrush(RGB(21,25,31));FillRect(dc,&r,bg);DeleteObject(bg);SetBkMode(dc,TRANSPARENT);SelectObject(dc,font);SetTextColor(dc,RGB(183,194,204));if(top){RECT grip={scale(4),0,scale(18),top};DrawTextW(dc,L"⠿",-1,&grip,DT_CENTER|DT_VCENTER|DT_SINGLELINE);}RECT s=r;s.top=r.bottom-bottom;s.left=scale(10);s.right-=scale(8);DrawTextW(dc,status.c_str(),-1,&s,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS);if(!player.initialized() || busy || !lastError.empty()){RECT body={scale(24),top+scale(18),r.right-scale(24),r.bottom-bottom-scale(10)};std::wstring text=busy?L"正在打开攻略…\n\n可以继续操作游戏，加载完成后开始播放。":!lastError.empty()?wide(lastError)+L"\n\n右键 → 重试当前分 P，或打开其他链接。":std::wstring(L"攻略就在游戏旁边\n\n打开 B 站链接，选择你的路线\n暂停、倒退、继续都可以用快捷键\n\n")+(settings.menu_bar_visible?L"右键打开菜单 · 拖动上方空白处移动":L"右键显示菜单栏 · 拖动底部状态栏移动");DrawTextW(dc,text.c_str(),-1,&body,DT_CENTER|DT_WORDBREAK);}EndPaint(window,&p);}
     void draw_button(DRAWITEMSTRUCT* item){HBRUSH b=CreateSolidBrush((item->itemState&ODS_SELECTED)?RGB(49,80,80):RGB(35,43,52));FillRect(item->hDC,&item->rcItem,b);DeleteObject(b);SetBkMode(item->hDC,TRANSPARENT);SetTextColor(item->hDC,RGB(224,233,239));SelectObject(item->hDC,font);wchar_t label[64];GetWindowTextW(item->hwndItem,label,64);DrawTextW(item->hDC,label,-1,&item->rcItem,DT_CENTER|DT_VCENTER|DT_SINGLELINE);}
     void close(){if(closing)return;trace_event("window-close");if(player.initialized())state=player.snapshot();save_safely();closing=true;cancel_jobs();unregister_keys();KillTimer(window,1);player.shutdown();if(trayAdded)Shell_NotifyIconW(NIM_DELETE,&tray);DestroyWindow(window);}
 };
@@ -195,17 +212,22 @@ LRESULT CALLBACK window_proc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){App* app=rein
     case WM_DRAWITEM:app->draw_button(reinterpret_cast<DRAWITEMSTRUCT*>(l));return TRUE;
     case WM_CTLCOLORSTATIC:{HDC dc=reinterpret_cast<HDC>(w);SetTextColor(dc,RGB(183,194,204));SetBkColor(dc,RGB(21,25,31));SetDCBrushColor(dc,RGB(21,25,31));return reinterpret_cast<LRESULT>(GetStockObject(DC_BRUSH));}
     case WM_SIZE:app->layout();return 0;
+    case WM_NCHITTEST:{
+        auto hit=DefWindowProcW(hwnd,msg,w,l);
+        if(hit==HTCLIENT && !app->settings.menu_bar_visible){RECT client;GetClientRect(hwnd,&client);POINT p={GET_X_LPARAM(l),GET_Y_LPARAM(l)};ScreenToClient(hwnd,&p);if(p.y>=client.bottom-app->bottom && p.y<client.bottom)return HTCAPTION;}
+        return hit;
+    }
     case WM_GETMINMAXINFO:{auto p=reinterpret_cast<MINMAXINFO*>(l);p->ptMinTrackSize={app->scale(330),app->scale(230)};return 0;}
     case WM_SIZING:{auto r=reinterpret_cast<RECT*>(l);int w2=r->right-r->left;int height=(w2*9)/16+app->top+app->bottom+GetSystemMetrics(SM_CYSIZEFRAME)*2;if(w==WMSZ_TOP || w==WMSZ_TOPLEFT || w==WMSZ_TOPRIGHT)r->top=r->bottom-height;else r->bottom=r->top+height;return TRUE;}
     case WM_EXITSIZEMOVE:app->save_safely();return 0;
-    case WM_DPICHANGED:{app->dpi=HIWORD(w);app->top=app->scale(34);app->bottom=app->scale(25);app->set_font();auto r=reinterpret_cast<RECT*>(l);SetWindowPos(hwnd,HWND_TOPMOST,r->left,r->top,r->right-r->left,r->bottom-r->top,SWP_NOACTIVATE);return 0;}
+    case WM_DPICHANGED:{app->dpi=HIWORD(w);app->bottom=app->scale(25);app->set_font();auto r=reinterpret_cast<RECT*>(l);SetWindowPos(hwnd,HWND_TOPMOST,r->left,r->top,r->right-r->left,r->bottom-r->top,SWP_NOACTIVATE);app->layout();return 0;}
     case WM_DISPLAYCHANGE:app->keep_on_screen();return 0;
     case WM_MOUSEACTIVATE:return MA_NOACTIVATE;
     case WM_LBUTTONDOWN:if(GET_Y_LPARAM(l)<app->top){ReleaseCapture();SendMessageW(hwnd,WM_NCLBUTTONDOWN,HTCAPTION,0);}return 0;
     case WM_CONTEXTMENU:{POINT p={GET_X_LPARAM(l),GET_Y_LPARAM(l)};if(p.x==-1)GetCursorPos(&p);app->menu(p);return 0;}
     case WM_COMMAND:app->command(LOWORD(w));return 0;
     case WM_KEYDOWN:if(GetKeyState(VK_CONTROL)<0){if(w=='O'){app->command(OPEN);return 0;}if(w=='P'){app->command(PARTS);return 0;}if(w==VK_OEM_COMMA){app->command(SETTINGS);return 0;}}break;
-    case WM_HOTKEY:if(!app->modal){switch(w){case 500:app->set_pass(!app->pass);break;case 501:app->toggle_hidden();break;case 502:app->pause();break;case 503:if(!app->busy){app->player.seek(-5);app->sync();}break;case 504:if(!app->busy){app->player.seek(5);app->sync();}break;case 505:app->step_speed(-1);break;case 506:app->step_speed(1);break;case 507:app->set_speed(1.0);break;}}return 0;
+    case WM_HOTKEY:if(!app->modal){switch(w){case 500:app->set_pass(!app->pass);break;case 501:app->toggle_hidden();break;case 502:app->pause();break;case 503:if(!app->busy){app->player.seek(-5);app->sync();}break;case 504:if(!app->busy){app->player.seek(5);app->sync();}break;case 505:app->step_speed(-1);break;case 506:app->step_speed(1);break;case 507:app->set_speed(1.0);break;case 508:app->command(MENU_BAR);break;}}return 0;
     case JOB_DONE:app->accept_results();return 0;
     case SHOW_EXISTING:app->show_existing();return 0;
     case MEDIA_EVENT:app->sync();return 0;
