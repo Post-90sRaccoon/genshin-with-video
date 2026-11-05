@@ -1,5 +1,13 @@
 # 验证记录
 
+2026-11-05 缩放越界、窗口位置与贴边修复（`codex/fix-resize-screen-bounds`，从 `develop` 的 `7d562fc` 创建）：一次缩放固定使用起始显示器的完整屏幕边界，在同一拖动矩形中约束比例、大小和锚点。限制针对可见窗口，不为任务栏预留区域；不可见缩放边框可伸出屏幕，可见内容仍须留在屏幕内。小窗可紧贴四边，松手后保存外框坐标，恢复时保留贴边位置。普通移动仍可跨屏；旧越界/过大窗口按比例恢复。
+
+- `scripts/build.ps1 -ControllerOnly` 通过，含 400 组四边/四角、96/120/144/168/192 DPI、菜单栏显隐、负坐标副屏、偏移屏幕及小于默认最小尺寸的边界场景，覆盖持续越界不漂移、回拉、锚点、比例、尺寸上下限与历史位置恢复；原有 144 组等比例缩放检查保留并通过。
+- 贴底回归先失败于 `visible bottom edge can touch the full monitor boundary without a transparent gap`。同样式窗口在 96 DPI 下实测：隐藏且未合成时 DWM 边距为零，显示并同步合成后左右/底部各有 6 像素不可见边框。正式程序在已合成帧测量并缓存边距，首次合成前使用 DPI 边框回退，避免逐次拖动时读取滞后的 DWM 矩形。原生 DWM 回归在屏幕外虚拟边界渲染，验证四边实际可见像素无缝贴齐，以及松手、任务栏通知、保存/读取后仍保持贴底。
+- 原生窗口过程验证缩放后的稳定坐标、过大窗口恢复及 `SetWindowPos` 同步尺寸检查。普通移动不沿用出发屏幕上限；DPI 调整期间使用目标屏幕的临时边界，回调探针验证其优先级和清理，保留此前跨 DPI 修复。
+- 独立审阅指出主题变化时清除旧边距过早会丢失贴边状态；新增回归先失败于 `theme frame growth preserves the previously docked visible bottom edge`，再保留旧数据直到新帧测量完成并对齐。模拟旧主题零边距到当前真实 DWM 边框的状态切换通过；全部控制器和媒体回归再次通过。
+- 30 项核心断言、离线存储/同步网络句柄集成及 `tests/diagnostics_tests.ps1` 通过。后端对象未变，按 `scripts/build.ps1` 相同编译/链接参数增量构建最终主程序成功，控制器测试增加系统 `dwmapi.lib` 链接。标准便携目录 `dist/GenshinVideo/GenshinVideo.exe` 已更新，build / dist SHA256 均为 `9431cf827f23dd9ad37c988c59b83d46866924c5fc28937a2ae23367abd600eb`。真实 DWM 帧验证在 96 DPI 完成，其他 DPI/多屏为合成坐标验证；未进行人工鼠标拖动、物理多显示器跨屏或实际切换系统主题验收。
+
 2026-11-05 上下边缘等比例缩放修复（`codex/fix-vertical-edge-resize`，从 `develop` 的 `ed281eb` 创建）：原先 `WM_SIZING` 只按宽度计算高度，会覆盖上下边缘的高度变化。现在上下边缘按高度反算宽度，左右边缘及四角沿用宽度驱动；按当前 DPI 扣除原生边框和顶部/底部信息区，保持实际视频区域 16:9。上下拖动时左侧固定，其他方向保留相对侧锚点，并同时遵守原有 330×230 的 DPI 缩放最小尺寸下限。
 
 - 新回归先在原实现失败：`FAIL dragging any resize edge changes video width with the requested scale`。修复后 `scripts/build.ps1 -ControllerOnly` 通过，包含四边/四角、放大/缩小、最小尺寸、负屏幕坐标、96/144/192 DPI、菜单栏显示/隐藏的 144 组几何场景；另将计算结果实际应用到 HWND，验证两种菜单状态下的视频客户区比例。

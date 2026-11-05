@@ -4,6 +4,7 @@
 #include <shellapi.h>
 #include <commctrl.h>
 #include <windowsx.h>
+#include <dwmapi.h>
 #include <thread>
 #include <memory>
 #include <deque>
@@ -11,9 +12,10 @@
 #include <iomanip>
 #include <algorithm>
 #include <ctime>
+#include <cmath>
 using namespace gv;
 namespace {
-constexpr UINT JOB_DONE=WM_APP+1,MEDIA_EVENT=WM_APP+2,TRAY_EVENT=WM_APP+3,SHOW_EXISTING=WM_APP+4;
+constexpr UINT JOB_DONE=WM_APP+1,MEDIA_EVENT=WM_APP+2,TRAY_EVENT=WM_APP+3,SHOW_EXISTING=WM_APP+4,FRAME_READY=WM_APP+5;
 const UINT TASKBAR_CREATED=RegisterWindowMessageW(L"TaskbarCreated");
 enum Command { OPEN=100,PARTS,SETTINGS,HIDE,PAUSE,PREVIOUS,NEXT,RETRY,FROM_START,PASS_THROUGH,QUIT,SPEED,MENU_BAR };
 constexpr int SPEED_FIRST=200;
@@ -31,6 +33,8 @@ public:
     std::array<bool,HOTKEY_COUNT> registered{};std::string message,lastError,storageWarning,hotkeyWarning;std::wstring status;Snapshot state;double lastPosition=0;int lastSave=0;
     UINT dpi=96;int top=34,bottom=25;std::array<HWND,6> buttons{};NOTIFYICONDATAW tray={};bool trayAdded=false;ULONGLONG loadStarted=0;
     long long renewedDeadline=0;
+    std::optional<RECT> resizeScreen,dpiScreen;bool resizing=false;
+    RECT frameInsets={};UINT frameDpi=96;bool frameMeasured=false;
     explicit App():store(executable_dir()+L"\\data"),settings(read_settings(store.data["settings"])) {storageWarning=store.warning;}
     ~App(){closing=true;for(auto& j:jobs)j->cancel->cancel();for(auto& j:jobs)if(j->thread.joinable())j->thread.join();if(font)DeleteObject(font);}
     int scale(int v) const{return MulDiv(v,dpi,96);}
@@ -47,8 +51,58 @@ public:
         layout();update_status();
     }
     void add_tray(){tray.cbSize=sizeof(tray);tray.hWnd=window;tray.uID=1;tray.uFlags=NIF_MESSAGE|NIF_ICON|NIF_TIP;tray.uCallbackMessage=TRAY_EVENT;tray.hIcon=LoadIconW(nullptr,IDI_APPLICATION);wcscpy_s(tray.szTip,L"原神攻略小窗 · 右键控制 / 显示窗口");trayAdded=Shell_NotifyIconW(NIM_ADD,&tray)!=FALSE;if(hidden && !trayAdded && !registered[1])show_existing();}
-    void show_existing(){if(hidden)toggle_hidden();if(pass)set_pass(false);ShowWindow(window,SW_SHOWNOACTIVATE);SetWindowPos(window,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW);}
-    void keep_on_screen(){RECT r;if(!GetWindowRect(window,&r))return;MONITORINFO info={sizeof(info)};if(!GetMonitorInfoW(MonitorFromRect(&r,MONITOR_DEFAULTTONEAREST),&info))return;int width=std::min(r.right-r.left,info.rcWork.right-info.rcWork.left),height=std::min(r.bottom-r.top,info.rcWork.bottom-info.rcWork.top);int x=std::clamp<LONG>(r.left,info.rcWork.left,info.rcWork.right-width),y=std::clamp<LONG>(r.top,info.rcWork.top,info.rcWork.bottom-height);SetWindowPos(window,HWND_TOPMOST,x,y,width,height,SWP_NOACTIVATE);}
+    void show_existing(){if(hidden)toggle_hidden();if(pass)set_pass(false);keep_on_screen();ShowWindow(window,SW_SHOWNOACTIVATE);SetWindowPos(window,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW);PostMessageW(window,FRAME_READY,0,0);}
+    RECT screen_area(const RECT* rect=nullptr) const{
+        MONITORINFO info={sizeof(info)};
+        HMONITOR monitor=rect?MonitorFromRect(rect,MONITOR_DEFAULTTONEAREST):MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST);
+        if(GetMonitorInfoW(monitor,&info))return info.rcMonitor;
+        return {0,0,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN)};
+    }
+    RECT active_screen_area() const{if(dpiScreen)return *dpiScreen;return resizing && resizeScreen?*resizeScreen:screen_area();}
+    RECT invisible_frame() const{
+        if(frameMeasured)return {MulDiv(frameInsets.left,dpi,frameDpi),MulDiv(frameInsets.top,dpi,frameDpi),MulDiv(frameInsets.right,dpi,frameDpi),MulDiv(frameInsets.bottom,dpi,frameDpi)};
+        BOOL composition=FALSE;DWORD style=static_cast<DWORD>(GetWindowLongPtrW(window,GWL_STYLE));
+        if(FAILED(DwmIsCompositionEnabled(&composition)) || !composition || !(style&WS_THICKFRAME))return {};
+        RECT frame={};AdjustWindowRectExForDpi(&frame,style,GetMenu(window)!=nullptr,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_EXSTYLE)),dpi);
+        // Before the first composed frame, leave the visible border inside the screen.
+        return {std::max<LONG>(0,-frame.left-scale(1)),0,std::max<LONG>(0,frame.right-scale(1)),std::max<LONG>(0,frame.bottom-scale(1))};
+    }
+    RECT outer_bounds(const RECT& screen) const{RECT margin=invisible_frame();return {screen.left-margin.left,screen.top-margin.top,screen.right+margin.right,screen.bottom+margin.bottom};}
+    RECT visible_rect(const RECT& outer) const{RECT margin=invisible_frame();return {outer.left+margin.left,outer.top+margin.top,outer.right-margin.right,outer.bottom-margin.bottom};}
+    void refresh_frame_insets(bool alignDocked=true){
+        if(!IsWindowVisible(window))return;
+        // Cache only a synchronized frame; querying DWM on every drag message can lag the live HWND.
+        BOOL composition=FALSE;if(FAILED(DwmIsCompositionEnabled(&composition)))return;
+        if(composition)DwmFlush();RECT outer,visible,frame={};if(!GetWindowRect(window,&outer))return;
+        if(composition){if(FAILED(DwmGetWindowAttribute(window,DWMWA_EXTENDED_FRAME_BOUNDS,&visible,sizeof(visible))))return;}else visible=outer;
+        UINT actualDpi=GetDpiForWindow(window);if(!actualDpi)return;
+        AdjustWindowRectExForDpi(&frame,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_STYLE)),GetMenu(window)!=nullptr,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_EXSTYLE)),actualDpi);
+        RECT margin={visible.left-outer.left,visible.top-outer.top,outer.right-visible.right,outer.bottom-visible.bottom};
+        if(visible.right<=visible.left || visible.bottom<=visible.top || margin.left<0 || margin.top<0 || margin.right<0 || margin.bottom<0 || margin.left>-frame.left || margin.top>-frame.top || margin.right>frame.right || margin.bottom>frame.bottom)return;
+        RECT screen=active_screen_area(),before=outer_bounds(screen);frameInsets=margin;frameDpi=actualDpi;frameMeasured=true;
+        if(alignDocked){
+            RECT after=outer_bounds(screen),adjusted=outer;LONG dx=0,dy=0;
+            if(std::abs(outer.right-before.right)<=1)dx=after.right-outer.right;else if(std::abs(outer.left-before.left)<=1)dx=after.left-outer.left;
+            if(std::abs(outer.bottom-before.bottom)<=1)dy=after.bottom-outer.bottom;else if(std::abs(outer.top-before.top)<=1)dy=after.top-outer.top;
+            OffsetRect(&adjusted,dx,dy);fit_rect(adjusted,screen);
+            if(!EqualRect(&adjusted,&outer))SetWindowPos(window,nullptr,adjusted.left,adjusted.top,adjusted.right-adjusted.left,adjusted.bottom-adjusted.top,SWP_NOZORDER|SWP_NOACTIVATE);
+        }
+    }
+    void fit_rect(RECT& rect,const RECT& screen){
+        RECT work=outer_bounds(screen);
+        if(work.right<=work.left || work.bottom<=work.top)return;
+        LONG width=rect.right-rect.left,height=rect.bottom-rect.top;
+        if(width<1 || height<1 || width>work.right-work.left || height>work.bottom-work.top){
+            RECT fit={work.left,work.top,work.left+std::max<LONG>(1,width),work.top+std::max<LONG>(1,height)};
+            constrain_size(WMSZ_BOTTOMRIGHT,fit,&screen);width=fit.right-fit.left;height=fit.bottom-fit.top;
+        }
+        LONG x=std::clamp(rect.left,work.left,work.right-width),y=std::clamp(rect.top,work.top,work.bottom-height);
+        rect={x,y,x+width,y+height};
+    }
+    void keep_on_screen(){
+        RECT before;if(!GetWindowRect(window,&before))return;RECT rect=before;fit_rect(rect,active_screen_area());
+        if(!EqualRect(&rect,&before))SetWindowPos(window,HWND_TOPMOST,rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,SWP_NOACTIVATE);
+    }
     void layout(){
         top=settings.menu_bar_visible?scale(34):0;
         RECT r;GetClientRect(window,&r);int x=scale(18),gap=scale(4),width=std::min(scale(55),std::max(1,(static_cast<int>(r.right)-scale(26)-gap*5)/6));
@@ -57,7 +111,8 @@ public:
         if(statusLabel)MoveWindow(statusLabel,scale(8),r.bottom-bottom,std::max<LONG>(1,r.right-scale(16)),bottom,TRUE);
         InvalidateRect(window,nullptr,FALSE);
     }
-    void constrain_size(UINT edge,RECT& rect){
+    void constrain_size(UINT edge,RECT& rect,const RECT* screen=nullptr){
+        RECT allowed={};const RECT* work=nullptr;if(screen){allowed=outer_bounds(*screen);work=&allowed;}
         RECT frame={};
         AdjustWindowRectExForDpi(&frame,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_STYLE)),GetMenu(window)!=nullptr,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_EXSTYLE)),dpi);
         int frameWidth=static_cast<int>(frame.right-frame.left),overhead=static_cast<int>(frame.bottom-frame.top)+top+bottom;
@@ -67,13 +122,31 @@ public:
         bool vertical=edge==WMSZ_TOP || edge==WMSZ_BOTTOM;
         int proposed=vertical?MulDiv(rect.bottom-rect.top-overhead,16,9):static_cast<int>(rect.right-rect.left)-frameWidth;
         int videoWidth=std::max(minVideoWidth,proposed);
+        bool left=edge==WMSZ_LEFT || edge==WMSZ_TOPLEFT || edge==WMSZ_BOTTOMLEFT;
+        bool upper=edge==WMSZ_TOP || edge==WMSZ_TOPLEFT || edge==WMSZ_TOPRIGHT;
+        LONG anchorX=left?rect.right:rect.left,anchorY=upper?rect.bottom:rect.top;
+        if(work){
+            int availableWidth=static_cast<int>(work->right-work->left)-frameWidth,availableHeight=static_cast<int>(work->bottom-work->top)-overhead;
+            if(availableWidth<1 || availableHeight<1){rect=*work;return;}
+            // MulDiv rounds height to nearest: this inverse also accepts its last fitting pixel.
+            auto max_width=[](int width,int height){return std::min(width,(height*16+7)/9);};
+            int fullMaximum=max_width(availableWidth,availableHeight);
+            minVideoWidth=std::min(minVideoWidth,fullMaximum);
+            int minWidth=minVideoWidth+frameWidth,minHeight=MulDiv(minVideoWidth,9,16)+overhead;
+            anchorX=left?std::clamp<LONG>(anchorX,work->left+minWidth,work->right):std::clamp<LONG>(anchorX,work->left,work->right-minWidth);
+            anchorY=upper?std::clamp<LONG>(anchorY,work->top+minHeight,work->bottom):std::clamp<LONG>(anchorY,work->top,work->bottom-minHeight);
+            availableWidth=static_cast<int>(left?anchorX-work->left:work->right-anchorX)-frameWidth;
+            availableHeight=static_cast<int>(upper?anchorY-work->top:work->bottom-anchorY)-overhead;
+            int maximum=max_width(availableWidth,availableHeight);
+            videoWidth=std::clamp(proposed,minVideoWidth,maximum);
+        }
         int width=videoWidth+frameWidth,height=MulDiv(videoWidth,9,16)+overhead;
-        if(edge==WMSZ_LEFT || edge==WMSZ_TOPLEFT || edge==WMSZ_BOTTOMLEFT)rect.left=rect.right-width;else rect.right=rect.left+width;
-        if(edge==WMSZ_TOP || edge==WMSZ_TOPLEFT || edge==WMSZ_TOPRIGHT)rect.top=rect.bottom-height;else rect.bottom=rect.top+height;
+        rect.left=left?anchorX-width:anchorX;rect.right=rect.left+width;
+        rect.top=upper?anchorY-height:anchorY;rect.bottom=rect.top+height;
     }
     void unregister_keys(){for(int i=0;i<HOTKEY_COUNT;++i){UnregisterHotKey(window,500+i);registered[i]=false;}}
     void register_keys(){unregister_keys();std::wstring failed;for(int i=0;i<HOTKEY_COUNT;++i){registered[i]=RegisterHotKey(window,500+i,hotkey_modifiers(settings.hotkeys[i]),LOBYTE(settings.hotkeys[i]))!=FALSE;if(!registered[i]){if(!failed.empty())failed+=L"、";failed+=hotkey_name(settings.hotkeys[i]);}}if(!registered[0] && pass)set_pass(false);hotkeyWarning=failed.empty()?"":"快捷键被占用："+utf8(failed)+"；请在设置中更换";}
-    void geometry(){if(!IsWindow(window))return;RECT r;GetWindowRect(window,&r);store.data["window"]={{"x",r.left},{"y",r.top},{"width",r.right-r.left},{"height",r.bottom-r.top}};}
+    void geometry(){if(!IsWindow(window))return;RECT r;GetWindowRect(window,&r);fit_rect(r,active_screen_area());store.data["window"]={{"x",r.left},{"y",r.top},{"width",r.right-r.left},{"height",r.bottom-r.top}};}
     void save(){if(guide && state.loaded && state.position_valid && !busy){lastPosition=state.position;store.remember(guide->bvid,guide->parts.at(index).cid,state.position);}geometry();store.data["settings"]=write_settings(settings);store.save();}
     void save_safely(){try{save();storageWarning.clear();}catch(const std::exception& e){storageWarning=e.what();}update_status();}
     void cancel_jobs(){for(auto& j:jobs)if(!j->done)j->cancel->cancel();}
@@ -152,8 +225,8 @@ public:
         if(buttons[5])SetWindowTextW(buttons[5],speed_text(settings.speed).c_str());
         std::wstring title=L"原神攻略小窗";if(guide)title+=L" · P"+std::to_wstring(guide->parts[index].page)+L" · "+wide(guide->parts[index].title);SetWindowTextW(window,title.c_str());
     }
-    void set_pass(bool enabled){if(enabled && !registered[0]){MessageBoxW(window,L"鼠标穿透解除热键被其他程序占用。请先在设置里更换该热键。",L"需要可用的解除热键",MB_OK|MB_ICONINFORMATION);return;}pass=enabled;LONG_PTR style=GetWindowLongPtrW(window,GWL_EXSTYLE);if(enabled){style|=WS_EX_TRANSPARENT|WS_EX_LAYERED;SetWindowLongPtrW(window,GWL_EXSTYLE,style);SetLayeredWindowAttributes(window,0,255,LWA_ALPHA);}else{style&=~(WS_EX_TRANSPARENT|WS_EX_LAYERED);SetWindowLongPtrW(window,GWL_EXSTYLE,style);}SetWindowPos(window,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_FRAMECHANGED);update_status();}
-    void toggle_hidden(){if(!hidden){if(!registered[1] && !trayAdded){MessageBoxW(window,L"显示热键被占用，且托盘图标不可用。请先更换显示热键。",L"无法安全隐藏",MB_OK);return;}desiredPaused=true;player.set_pause(true);sync();save_safely();hidden=true;ShowWindow(window,SW_HIDE);}else{hidden=false;desiredPaused=true;player.set_pause(true);ShowWindow(window,SW_SHOWNOACTIVATE);SetWindowPos(window,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);sync();}update_status();}
+    void set_pass(bool enabled){if(enabled && !registered[0]){MessageBoxW(window,L"鼠标穿透解除热键被其他程序占用。请先在设置里更换该热键。",L"需要可用的解除热键",MB_OK|MB_ICONINFORMATION);return;}pass=enabled;LONG_PTR style=GetWindowLongPtrW(window,GWL_EXSTYLE);if(enabled){style|=WS_EX_TRANSPARENT|WS_EX_LAYERED;SetWindowLongPtrW(window,GWL_EXSTYLE,style);SetLayeredWindowAttributes(window,0,255,LWA_ALPHA);}else{style&=~(WS_EX_TRANSPARENT|WS_EX_LAYERED);SetWindowLongPtrW(window,GWL_EXSTYLE,style);}SetWindowPos(window,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_FRAMECHANGED);PostMessageW(window,FRAME_READY,0,0);update_status();}
+    void toggle_hidden(){if(!hidden){if(!registered[1] && !trayAdded){MessageBoxW(window,L"显示热键被占用，且托盘图标不可用。请先更换显示热键。",L"无法安全隐藏",MB_OK);return;}desiredPaused=true;player.set_pause(true);sync();save_safely();hidden=true;ShowWindow(window,SW_HIDE);}else{hidden=false;desiredPaused=true;player.set_pause(true);ShowWindow(window,SW_SHOWNOACTIVATE);SetWindowPos(window,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);PostMessageW(window,FRAME_READY,0,0);sync();}update_status();}
     void toggle_menu_bar(){settings.menu_bar_visible=!settings.menu_bar_visible;layout();save_safely();}
     void pause(){if(hidden)return;desiredPaused=!desiredPaused;trace_event("pause-request",desiredPaused?1:0);if(!busy && player.initialized()){player.set_pause(desiredPaused);sync();save_safely();}update_status();}
     void set_speed(double value){player.set_speed(value);settings.speed=value;if(player.initialized())state=player.snapshot();save_safely();}
@@ -231,11 +304,24 @@ LRESULT CALLBACK window_proc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){App* app=rein
         if(hit==HTCLIENT && !app->settings.menu_bar_visible){RECT client;GetClientRect(hwnd,&client);POINT p={GET_X_LPARAM(l),GET_Y_LPARAM(l)};ScreenToClient(hwnd,&p);if(p.y>=client.bottom-app->bottom && p.y<client.bottom)return HTCAPTION;}
         return hit;
     }
-    case WM_GETMINMAXINFO:{auto p=reinterpret_cast<MINMAXINFO*>(l);p->ptMinTrackSize={app->scale(330),app->scale(230)};return 0;}
-    case WM_SIZING:app->constrain_size(static_cast<UINT>(w),*reinterpret_cast<RECT*>(l));return TRUE;
-    case WM_EXITSIZEMOVE:app->save_safely();return 0;
-    case WM_DPICHANGED:{app->dpi=HIWORD(w);app->bottom=app->scale(25);app->set_font();auto r=reinterpret_cast<RECT*>(l);SetWindowPos(hwnd,HWND_TOPMOST,r->left,r->top,r->right-r->left,r->bottom-r->top,SWP_NOACTIVATE);app->layout();return 0;}
-    case WM_DISPLAYCHANGE:app->keep_on_screen();return 0;
+    case WM_GETMINMAXINFO:{
+        auto p=reinterpret_cast<MINMAXINFO*>(l);RECT work=app->active_screen_area(),maximum=app->outer_bounds(work);app->constrain_size(WMSZ_BOTTOMRIGHT,maximum,&work);
+        p->ptMaxTrackSize={maximum.right-maximum.left,maximum.bottom-maximum.top};p->ptMinTrackSize={std::min<LONG>(app->scale(330),p->ptMaxTrackSize.x),std::min<LONG>(app->scale(230),p->ptMaxTrackSize.y)};return 0;
+    }
+    case WM_ENTERSIZEMOVE:app->resizing=false;app->resizeScreen.reset();app->refresh_frame_insets();app->keep_on_screen();app->resizeScreen=app->screen_area();return 0;
+    case WM_SIZING:{if(!app->resizeScreen)app->resizeScreen=app->screen_area();app->resizing=true;app->constrain_size(static_cast<UINT>(w),*reinterpret_cast<RECT*>(l),&*app->resizeScreen);return TRUE;}
+    case WM_EXITSIZEMOVE:app->refresh_frame_insets();app->keep_on_screen();app->resizing=false;app->resizeScreen.reset();app->save_safely();return 0;
+    case WM_DPICHANGED:{
+        app->dpi=HIWORD(w);app->top=app->settings.menu_bar_visible?app->scale(34):0;app->bottom=app->scale(25);app->set_font();RECT r=*reinterpret_cast<RECT*>(l);
+        RECT destination=app->resizing && app->resizeScreen?*app->resizeScreen:app->screen_area(&r);
+        if(app->resizing && app->resizeScreen)app->constrain_size(WMSZ_BOTTOMRIGHT,r,&*app->resizeScreen);
+        else if(!app->resizeScreen)app->fit_rect(r,destination);
+        // SetWindowPos can synchronously query min/max before the new monitor is reflected by the HWND.
+        auto previous=app->dpiScreen;app->dpiScreen=destination;
+        SetWindowPos(hwnd,HWND_TOPMOST,r.left,r.top,r.right-r.left,r.bottom-r.top,SWP_NOACTIVATE);app->dpiScreen=previous;app->layout();PostMessageW(hwnd,FRAME_READY,0,0);return 0;
+    }
+    case WM_DISPLAYCHANGE:app->resizing=false;app->resizeScreen.reset();app->keep_on_screen();PostMessageW(hwnd,FRAME_READY,0,0);return 0;
+    case WM_SETTINGCHANGE:if(w==SPI_SETWORKAREA){if(app->resizeScreen)app->resizeScreen=app->screen_area();app->keep_on_screen();return 0;}break;
     case WM_MOUSEACTIVATE:return MA_NOACTIVATE;
     case WM_LBUTTONDOWN:if(GET_Y_LPARAM(l)<app->top){ReleaseCapture();SendMessageW(hwnd,WM_NCLBUTTONDOWN,HTCAPTION,0);}return 0;
     case WM_CONTEXTMENU:{POINT p={GET_X_LPARAM(l),GET_Y_LPARAM(l)};if(p.x==-1)GetCursorPos(&p);app->menu(p);return 0;}
@@ -244,6 +330,9 @@ LRESULT CALLBACK window_proc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){App* app=rein
     case WM_HOTKEY:if(!app->modal){switch(w){case 500:app->set_pass(!app->pass);break;case 501:app->toggle_hidden();break;case 502:app->pause();break;case 503:if(!app->busy){app->player.seek(-5);app->sync();}break;case 504:if(!app->busy){app->player.seek(5);app->sync();}break;case 505:app->step_speed(-1);break;case 506:app->step_speed(1);break;case 507:app->set_speed(1.0);break;case 508:app->command(MENU_BAR);break;}}return 0;
     case JOB_DONE:app->accept_results();return 0;
     case SHOW_EXISTING:app->show_existing();return 0;
+    case FRAME_READY:app->refresh_frame_insets(!app->resizeScreen);if(!app->resizeScreen)app->keep_on_screen();return 0;
+    // Keep the previous margins until refresh can reconcile the old docking against the new frame.
+    case WM_DWMCOMPOSITIONCHANGED:case WM_THEMECHANGED:PostMessageW(hwnd,FRAME_READY,0,0);return 0;
     case MEDIA_EVENT:app->sync();return 0;
     case WM_TIMER:app->timer();return 0;
     case TRAY_EVENT:if(l==WM_RBUTTONUP){POINT p;GetCursorPos(&p);app->menu(p);}else if(l==WM_LBUTTONDBLCLK){if(app->hidden)app->toggle_hidden();if(app->pass)app->set_pass(false);}return 0;
@@ -262,9 +351,9 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
         App app;WNDCLASSEXW wc={sizeof(wc)};wc.lpfnWndProc=window_proc;wc.hInstance=instance;wc.lpszClassName=className.c_str();wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.hIcon=LoadIconW(nullptr,IDI_APPLICATION);RegisterClassExW(&wc);
         RECT work={0,0,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN)};SystemParametersInfoW(SPI_GETWORKAREA,0,&work,0);UINT systemDpi=GetDpiForSystem();int minWidth=MulDiv(330,systemDpi,96),minHeight=MulDiv(230,systemDpi,96);int x=work.left+16,y=work.bottom-MulDiv(360,systemDpi,96),w=MulDiv(496,systemDpi,96),h=MulDiv(346,systemDpi,96);
         try {auto r=app.store.data.value("window",json::object());x=std::clamp(r.value("x",x),-100000,100000);y=std::clamp(r.value("y",y),-100000,100000);w=std::clamp(r.value("width",w),minWidth,3840);h=std::clamp(r.value("height",h),minHeight,2160);}catch(...){}
-        RECT saved={x,y,x+w,y+h};HMONITOR mon=MonitorFromRect(&saved,MONITOR_DEFAULTTONULL);if(!mon){x=work.left+16;y=std::max(work.top,work.bottom-h-16);}else{MONITORINFO info={sizeof(info)};GetMonitorInfoW(mon,&info);x=std::clamp<LONG>(x,info.rcWork.left,std::max(info.rcWork.left,info.rcWork.right-w));y=std::clamp<LONG>(y,info.rcWork.top,std::max(info.rcWork.top,info.rcWork.bottom-h));}
+        RECT saved={x,y,x+w,y+h};HMONITOR mon=MonitorFromRect(&saved,MONITOR_DEFAULTTONULL);if(!mon){x=work.left+16;y=std::max(work.top,work.bottom-h-16);}
         HWND hwnd=CreateWindowExW(WS_EX_TOPMOST|WS_EX_NOACTIVATE|WS_EX_APPWINDOW,wc.lpszClassName,L"原神攻略小窗",WS_POPUP|WS_THICKFRAME|WS_CLIPCHILDREN,x,y,w,h,nullptr,nullptr,instance,&app);
-        if(!hwnd)throw std::runtime_error("无法创建悬浮窗口");app.keep_on_screen();ShowWindow(hwnd,SW_SHOWNOACTIVATE);SetWindowPos(hwnd,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW);UpdateWindow(hwnd);
+        if(!hwnd)throw std::runtime_error("无法创建悬浮窗口");app.keep_on_screen();ShowWindow(hwnd,SW_SHOWNOACTIVATE);SetWindowPos(hwnd,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW);UpdateWindow(hwnd);PostMessageW(hwnd,FRAME_READY,0,0);
         int argc=0;auto argv=CommandLineToArgvW(GetCommandLineW(),&argc);std::string initial;if(argc>1)initial=utf8(argv[1]);if(argv)LocalFree(argv);
         if(!initial.empty()){try{app.open(parse_video_url(initial));}catch(const std::exception& e){app.fail(e.what());}}
         MSG msg;int received;while((received=GetMessageW(&msg,nullptr,0,0))>0){if(IsDialogMessageW(hwnd,&msg))continue;TranslateMessage(&msg);DispatchMessageW(&msg);}trace_event("message-loop-exit",received);if(mutex)CloseHandle(mutex);return 0;
