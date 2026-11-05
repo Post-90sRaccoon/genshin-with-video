@@ -11,23 +11,36 @@ int main(){
     INITCOMMONCONTROLSEX controls={sizeof(controls),ICC_STANDARD_CLASSES|ICC_WIN95_CLASSES};InitCommonControlsEx(&controls);
     HWND host=CreateWindowExW(0,L"STATIC",L"Controller test",WS_POPUP,0,0,480,320,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
     try{
+        expect(write_settings(read_settings({{"menu_bar_visible",false}})).value("menu_bar_visible",true)==false,"hidden menu bar survives settings roundtrip");
+        expect(write_settings(read_settings(json::object())).value("menu_bar_visible",false),"legacy settings show the menu bar by default");
+        for(const json& bad:std::vector<json>{nullptr,"false",0,1,json::array(),json::object()}){
+            expect(write_settings(read_settings({{"menu_bar_visible",bad}})).value("menu_bar_visible",false),"invalid saved menu visibility falls back to visible");
+        }
         {
             json oldKeys=json::array({VK_F6,VK_F7,VK_F8,VK_F9,VK_F10});
             auto migrated=read_settings({{"hotkeys",oldKeys}});
             auto keys=write_settings(migrated)["hotkeys"];
-            expect(keys.size()==8,"legacy hotkey settings gain three speed shortcuts");
+            expect(keys.size()==9,"legacy hotkey settings gain speed and menu-bar shortcuts");
             for(size_t i=0;i<5;++i)expect(keys[i]==oldKeys[i],"migration preserves existing hotkeys");
             expect(keys[5]==MAKEWORD(VK_OEM_4,HOTKEYF_CONTROL|HOTKEYF_ALT) && keys[6]==MAKEWORD(VK_OEM_6,HOTKEYF_CONTROL|HOTKEYF_ALT) && keys[7]==MAKEWORD('0',HOTKEYF_CONTROL|HOTKEYF_ALT),"new shortcuts have documented default combinations");
+            expect(keys[8]==MAKEWORD('M',HOTKEYF_CONTROL|HOTKEYF_ALT),"menu-bar toggle defaults to Ctrl+Alt+M");
             oldKeys[3]=MAKEWORD(VK_OEM_4,HOTKEYF_CONTROL|HOTKEYF_ALT);
             oldKeys[4]=MAKEWORD(VK_OEM_6,HOTKEYF_CONTROL|HOTKEYF_ALT);
             auto custom=write_settings(read_settings({{"hotkeys",oldKeys}}))["hotkeys"];
             expect(custom[3]==oldKeys[3] && custom[4]==oldKeys[4],"legacy custom bindings retain priority over new defaults");
             std::set<int> unique;for(const auto& key:custom)unique.insert(key.get<int>());
-            expect(unique.size()==8,"migration resolves new-default conflicts without duplicate bindings");
+            expect(unique.size()==9,"migration resolves new-default conflicts without duplicate bindings");
             custom[5]=MAKEWORD(VK_F2,HOTKEYF_SHIFT|HOTKEYF_CONTROL);
             custom[6]=MAKEWORD(VK_F3,HOTKEYF_SHIFT|HOTKEYF_CONTROL);
             custom[7]=MAKEWORD(VK_F4,HOTKEYF_SHIFT|HOTKEYF_CONTROL);
-            expect(write_settings(read_settings({{"hotkeys",custom}}))["hotkeys"]==custom,"all eight customized hotkeys survive roundtrip");
+            custom[8]=MAKEWORD(VK_F5,HOTKEYF_SHIFT|HOTKEYF_CONTROL);
+            expect(write_settings(read_settings({{"hotkeys",custom}}))["hotkeys"]==custom,"all nine customized hotkeys survive roundtrip");
+            json eight=custom;eight.erase(eight.end()-1);eight[0]=MAKEWORD('M',HOTKEYF_CONTROL|HOTKEYF_ALT);
+            auto upgraded=write_settings(read_settings({{"hotkeys",eight}}))["hotkeys"];
+            expect(upgraded.size()==9,"eight-key settings gain the menu-bar shortcut");
+            for(size_t i=0;i<eight.size();++i)expect(upgraded[i]==eight[i],"eight-key migration preserves every custom binding");
+            unique.clear();for(const auto& key:upgraded)unique.insert(key.get<int>());
+            expect(unique.size()==9 && upgraded[8]!=eight[0],"menu-bar shortcut chooses a fallback when a legacy binding owns its default");
         }
         {
             App shortcuts;shortcuts.window=host;shortcuts.settings=Settings{};
@@ -45,12 +58,15 @@ int main(){
             expect(shortcuts.settings.speed==1.5,"settings and picker dialogs ignore speed hotkeys");
             shortcuts.modal=false;shortcuts.hidden=true;shortcuts.desiredPaused=true;hotkey(506);
             expect(shortcuts.settings.speed==1.75 && shortcuts.hidden && shortcuts.desiredPaused,"hidden speed changes preserve visibility and pause intent");
-            for(int i=0;i<8;++i)shortcuts.settings.hotkeys[i]=MAKEWORD(VK_F13+i,HOTKEYF_CONTROL|HOTKEYF_ALT|HOTKEYF_SHIFT);
+            for(int i=0;i<HOTKEY_COUNT;++i)shortcuts.settings.hotkeys[i]=MAKEWORD(VK_F13+i,HOTKEYF_CONTROL|HOTKEYF_ALT|HOTKEYF_SHIFT);
             shortcuts.register_keys();
             expect(shortcuts.registered[5] && shortcuts.registered[6] && shortcuts.registered[7],"new speed hotkeys are registered with Windows");
+            expect(shortcuts.registered[8],"menu-bar hotkey is registered with Windows");
             shortcuts.unregister_keys();
             HWND owner=CreateWindowExW(0,L"STATIC",L"Hotkey release fixture",WS_POPUP,0,0,1,1,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
             expect(RegisterHotKey(owner,1,hotkey_modifiers(shortcuts.settings.hotkeys[6]),LOBYTE(shortcuts.settings.hotkeys[6]))!=FALSE,"all new speed hotkeys are released on unregister");
+            UnregisterHotKey(owner,1);
+            expect(RegisterHotKey(owner,1,hotkey_modifiers(shortcuts.settings.hotkeys[8]),LOBYTE(shortcuts.settings.hotkeys[8]))!=FALSE,"menu-bar hotkey is released on unregister");
             UnregisterHotKey(owner,1);DestroyWindow(owner);SetWindowLongPtrW(host,GWLP_USERDATA,previous);
         }
         {
@@ -58,13 +74,13 @@ int main(){
             HWND settings=CreateDialogParamW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(IDD_SETTINGS),host,procedure,0);
             expect(settings!=nullptr,"settings resource can be created");
             RECT client;GetClientRect(settings,&client);LONG last=0;
-            for(int i=0;i<8;++i){
+            for(int i=0;i<HOTKEY_COUNT;++i){
                 HWND key=GetDlgItem(settings,IDC_HOTKEY_FIRST+i);expect(key!=nullptr,"settings exposes every configurable hotkey");
                 RECT bounds;GetWindowRect(key,&bounds);MapWindowPoints(nullptr,settings,reinterpret_cast<POINT*>(&bounds),2);
                 expect(bounds.top>=last && bounds.bottom<=client.bottom,"settings hotkey fields fit without overlap");last=bounds.bottom;
             }
             RECT cookies;GetWindowRect(GetDlgItem(settings,IDC_COOKIES),&cookies);MapWindowPoints(nullptr,settings,reinterpret_cast<POINT*>(&cookies),2);
-            expect(cookies.top>last && cookies.bottom<=client.bottom,"login fields remain below all eight hotkeys");DestroyWindow(settings);
+            expect(cookies.top>last && cookies.bottom<=client.bottom,"login fields remain below all nine hotkeys");DestroyWindow(settings);
         }
         for(double rate:{0.5,0.75,1.0,1.25,1.5,1.75,2.0}){
             auto saved=write_settings(read_settings({{"speed",rate}}));
@@ -98,6 +114,10 @@ int main(){
             expect((GetMenuState(rates,204,MF_BYCOMMAND)&MF_CHECKED)!=0,"the selected speed is checked in the native menu");
             expect((GetMenuState(rates,202,MF_BYCOMMAND)&MF_CHECKED)==0,"normal speed is unchecked after a change");
             DestroyMenu(rates);
+            HMENU context=toolbar.context_menu();
+            expect((GetMenuState(context,MENU_BAR,MF_BYCOMMAND)&MF_CHECKED)!=0,"context menu checks the visible menu bar");
+            wchar_t menuLabel[128]={};GetMenuStringW(context,MENU_BAR,menuLabel,128,MF_BYCOMMAND);
+            expect(std::wstring(menuLabel).find(hotkey_name(toolbar.settings.hotkeys[8]))!=std::wstring::npos,"context menu shows the configured menu-bar shortcut");DestroyMenu(context);
             for(UINT dpi:{96u,144u,192u}){
                 toolbar.dpi=dpi;toolbar.top=toolbar.scale(34);toolbar.bottom=toolbar.scale(25);toolbar.set_font();
                 SetWindowPos(ui,nullptr,0,0,toolbar.scale(330),toolbar.scale(230),SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOMOVE);toolbar.layout();
@@ -110,7 +130,43 @@ int main(){
                     expect(size.cx<=bounds.right-bounds.left,"toolbar labels fit without clipping");
                 }
             }
+            auto previous=GetWindowLongPtrW(ui,GWLP_USERDATA);SetWindowLongPtrW(ui,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&toolbar));
+            RECT before;GetWindowRect(ui,&before);
+            window_proc(ui,WM_HOTKEY,508,0);
+            expect(!write_settings(toolbar.settings).value("menu_bar_visible",true) && toolbar.top==0,"global menu-bar shortcut hides the bar and removes its inset");
+            context=toolbar.context_menu();
+            expect((GetMenuState(context,MENU_BAR,MF_BYCOMMAND)&(MF_CHECKED|MF_GRAYED))==0,"context menu offers enabled recovery while menu bar is hidden");DestroyMenu(context);
+            for(auto button:toolbar.buttons)expect((GetWindowLongPtrW(button,GWL_STYLE)&WS_VISIBLE)==0,"hidden menu-bar buttons leave the visible and tab-navigation surfaces");
+            expect((GetWindowLongPtrW(toolbar.statusLabel,GWL_STYLE)&WS_VISIBLE)!=0,"playback status stays visible when the menu bar is hidden");
+            RECT after;GetWindowRect(ui,&after);expect(EqualRect(&before,&after)!=FALSE,"menu-bar toggle preserves outer window bounds");
+            Store persisted(executable_dir()+L"\\speed-toolbar-test-data");
+            expect(persisted.data["settings"].value("menu_bar_visible",true)==false,"menu-bar visibility is saved immediately");
+            for(UINT dpi:{96u,144u,192u}){
+                RECT suggested={0,0,toolbar.scale(330),toolbar.scale(230)};
+                window_proc(ui,WM_DPICHANGED,MAKELONG(dpi,dpi),reinterpret_cast<LPARAM>(&suggested));
+                RECT video;GetWindowRect(toolbar.video,&video);MapWindowPoints(nullptr,ui,reinterpret_cast<POINT*>(&video),2);
+                RECT client;GetClientRect(ui,&client);
+                expect(toolbar.top==0 && video.top==0 && video.bottom==client.bottom-toolbar.bottom,"hidden layout stays flush with the video at every DPI");
+                POINT drag={client.right/2,client.bottom-toolbar.bottom/2};ClientToScreen(ui,&drag);
+                expect(window_proc(ui,WM_NCHITTEST,0,MAKELPARAM(drag.x,drag.y))==HTCAPTION,"status strip remains a drag area without the menu bar");
+                expect(SendMessageW(toolbar.statusLabel,WM_NCHITTEST,0,MAKELPARAM(drag.x,drag.y))==HTTRANSPARENT,"status control lets the parent handle dragging");
+                expect(window_proc(ui,WM_NCHITTEST,0,MAKELPARAM(suggested.left,suggested.top))!=HTCAPTION,"status dragging preserves resize borders");
+                for(auto button:toolbar.buttons)expect((GetWindowLongPtrW(button,GWL_STYLE)&WS_VISIBLE)==0,"DPI change keeps every menu-bar button hidden");
+            }
+            toolbar.modal=true;window_proc(ui,WM_HOTKEY,508,0);
+            expect(toolbar.top==0,"modal dialogs ignore the menu-bar shortcut");
+            toolbar.modal=false;toolbar.hidden=true;toolbar.pass=true;toolbar.desiredPaused=true;window_proc(ui,WM_COMMAND,MENU_BAR,0);
+            expect(toolbar.top==toolbar.scale(34) && toolbar.hidden && toolbar.pass && toolbar.desiredPaused,"restoring menu bar preserves window visibility, pass-through and pause intent");
+            for(auto button:toolbar.buttons)expect((GetWindowLongPtrW(button,GWL_STYLE)&WS_VISIBLE)!=0,"restoring menu bar shows every button");
+            toolbar.pass=false;SetWindowLongPtrW(ui,GWLP_USERDATA,previous);
             toolbar.close();
+            App restored;restored.settings=read_settings(persisted.data["settings"]);
+            restored.store=Store(executable_dir()+L"\\menu-bar-startup-test-data");
+            restored.window=CreateWindowExW(0,L"STATIC",L"Hidden menu startup",WS_POPUP|WS_THICKFRAME,0,0,330,230,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+            restored.init();
+            expect(restored.top==0,"startup restores the saved hidden menu bar");
+            for(auto button:restored.buttons)expect((GetWindowLongPtrW(button,GWL_STYLE)&WS_VISIBLE)==0,"startup hides buttons before the outer window is shown");
+            restored.close();
         }
         App app;app.window=host;app.video=CreateWindowExW(0,L"STATIC",L"",WS_CHILD,0,0,100,100,host,nullptr,GetModuleHandleW(nullptr),nullptr);
         app.guide=std::make_shared<Guide>(Guide{"BV1BMgj6MEz4","Guide",{{1,111,"first",60},{2,222,"second",120}}});
@@ -162,6 +218,11 @@ int main(){
         expect(app.state.position_valid,"loaded playhead must be explicitly valid");
         {
             auto entry=app.state.entry_id;double position=app.state.position;
+            app.desiredPaused=true;
+            auto prior=GetWindowLongPtrW(host,GWLP_USERDATA);SetWindowLongPtrW(host,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&app));
+            window_proc(host,WM_HOTKEY,508,0);auto menuHidden=app.player.snapshot();
+            expect(menuHidden.paused && menuHidden.entry_id==entry && std::abs(menuHidden.position-position)<0.01 && app.desiredPaused,"menu-bar toggle leaves real paused playback and its playhead intact");
+            window_proc(host,WM_HOTKEY,508,0);SetWindowLongPtrW(host,GWLP_USERDATA,prior);
             app.command(204);auto changed=app.player.snapshot();
             std::cerr<<"Paused speed snapshot: before="<<position<<" after="<<changed.position<<" valid="<<changed.position_valid<<" status="<<changed.position_status<<" paused="<<changed.paused<<" entries="<<entry<<"/"<<changed.entry_id<<" speed="<<changed.speed<<"\n";
             // Rebuilding audio tempo may adjust the reported audio clock by a small buffer duration.
@@ -177,6 +238,8 @@ int main(){
             auto pump=[&](DWORD milliseconds){auto end=GetTickCount64()+milliseconds;do{MSG msg;while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)){TranslateMessage(&msg);DispatchMessageW(&msg);}app.player.drain();Sleep(10);}while(GetTickCount64()<end);app.state=app.player.snapshot();};
             auto measure=[&](int command){
                 app.command(command);app.desiredPaused=false;app.player.set_pause(false);pump(700);
+                auto playing=app.player.snapshot();app.command(MENU_BAR);auto toggled=app.player.snapshot();
+                expect(!toggled.paused && !app.desiredPaused && toggled.entry_id==playing.entry_id && toggled.speed==playing.speed,"menu-bar toggle preserves running playback, entry and speed");app.command(MENU_BAR);
                 double before=app.state.position;auto wall=GetTickCount64();pump(1200);
                 double rate=(app.state.position-before)/((GetTickCount64()-wall)/1000.0);
                 app.player.set_pause(true);app.desiredPaused=true;return rate;
@@ -223,6 +286,11 @@ int main(){
         app.cancel_jobs();
         HWND owner=CreateWindowExW(0,L"STATIC",L"Hotkey fixture",WS_POPUP,0,0,1,1,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
         expect(RegisterHotKey(owner,1,MOD_CONTROL|MOD_ALT|MOD_NOREPEAT,VK_F24)!=FALSE,"controlled hotkey owner");
+        auto menuKey=app.settings.hotkeys[8];app.settings.hotkeys[8]=MAKEWORD(VK_F24,HOTKEYF_CONTROL|HOTKEYF_ALT);app.register_keys();
+        expect(!app.registered[8] && !app.hotkeyWarning.empty(),"menu-bar hotkey conflict is reported");
+        app.settings.menu_bar_visible=false;app.command(MENU_BAR);
+        expect(app.settings.menu_bar_visible,"context-menu command can recover the menu bar when its shortcut is occupied");
+        app.unregister_keys();app.settings.hotkeys[8]=menuKey;
         auto fasterKey=app.settings.hotkeys[6];app.settings.hotkeys[6]=MAKEWORD(VK_F24,HOTKEYF_CONTROL|HOTKEYF_ALT);app.register_keys();
         expect(!app.registered[6] && !app.hotkeyWarning.empty(),"a speed hotkey conflict is reported");app.unregister_keys();app.settings.hotkeys[6]=fasterKey;
         app.settings.hotkeys[0]=MAKEWORD(VK_F24,HOTKEYF_CONTROL|HOTKEYF_ALT);app.pass=true;app.register_keys();
@@ -232,7 +300,7 @@ int main(){
         expect(!app.hidden && app.desiredPaused,"relaunch recovery shows the window paused");
         app.store=Store(executable_path());app.save_safely();app.message.clear();app.update_status();
         expect(!app.storageWarning.empty() && app.status==wide(app.storageWarning),"save warning survives transient status changes");
-        std::cout<<"PASS controller speed, modal, visibility and warning regressions\n";
+        std::cout<<"PASS controller speed, menu bar, modal, visibility and warning regressions\n";
     }catch(const std::exception& e){std::cerr<<"FAIL "<<e.what()<<"\n";DestroyWindow(host);return 1;}
     DestroyWindow(host);
 }
