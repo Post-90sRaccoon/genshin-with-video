@@ -5,13 +5,168 @@
 #include <cmath>
 #include <limits>
 #include <set>
+#include <dwmapi.h>
 #include "../src/resource.h"
 static void expect(bool value,const char* name){if(!value)throw std::runtime_error(name);}
+static void visible_edge_docking_regressions(){
+    HWND ui=CreateWindowExW(WS_EX_NOACTIVATE,L"STATIC",L"",WS_POPUP|WS_THICKFRAME,-10000,-10000,500,340,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+    expect(ui!=nullptr,"visible edge fixture");App app;app.window=ui;app.settings=Settings{};app.dpi=GetDpiForWindow(ui);app.top=app.scale(34);app.bottom=app.scale(25);
+    ShowWindow(ui,SW_SHOWNOACTIVATE);UpdateWindow(ui);DwmFlush();
+    RECT outer,visible;GetWindowRect(ui,&outer);expect(SUCCEEDED(DwmGetWindowAttribute(ui,DWMWA_EXTENDED_FRAME_BOUNDS,&visible,sizeof(visible))),"DWM visible frame is measurable");
+    RECT margin={visible.left-outer.left,visible.top-outer.top,outer.right-visible.right,outer.bottom-visible.bottom};app.refresh_frame_insets(false);
+    ShowWindow(ui,SW_HIDE);
+    MONITORINFO info={sizeof(info)};GetMonitorInfoW(MonitorFromWindow(ui,MONITOR_DEFAULTTONEAREST),&info);const RECT screen=info.rcMonitor;
+    LONG width=outer.right-outer.left,height=outer.bottom-outer.top;
+    RECT bottom={screen.left+20,screen.bottom+margin.bottom-height,screen.left+20+width,screen.bottom+margin.bottom};
+    RECT requested=bottom;app.fit_rect(bottom,screen);
+    expect(bottom.bottom-margin.bottom==screen.bottom && EqualRect(&bottom,&requested),"visible bottom edge can touch the full monitor boundary without a transparent gap");
+    RECT selected=app.screen_area();expect(EqualRect(&selected,&screen)!=FALSE,"overlay bounds use the full monitor rather than the taskbar work area");
+    // Compose away from the actual desktop, but verify real DWM pixels at four virtual screen edges.
+    RECT virtualScreen={-10500,-10500,-9000,-9000};app.resizeScreen=virtualScreen;app.resizing=true;
+    for(int edge=0;edge<4;++edge){
+        RECT target={virtualScreen.left+100,virtualScreen.top+100,virtualScreen.left+100+width,virtualScreen.top+100+height};
+        if(edge==0)OffsetRect(&target,virtualScreen.left-margin.left-target.left,0);
+        if(edge==1)OffsetRect(&target,virtualScreen.right+margin.right-target.right,0);
+        if(edge==2)OffsetRect(&target,0,virtualScreen.top-margin.top-target.top);
+        if(edge==3)OffsetRect(&target,0,virtualScreen.bottom+margin.bottom-target.bottom);
+        RECT wanted=target;app.fit_rect(target,virtualScreen);expect(EqualRect(&wanted,&target)!=FALSE,"four-edge docking preserves the requested outer rectangle");
+        SetWindowPos(ui,nullptr,target.left,target.top,width,height,SWP_NOZORDER|SWP_NOACTIVATE);ShowWindow(ui,SW_SHOWNOACTIVATE);UpdateWindow(ui);DwmFlush();
+        expect(SUCCEEDED(DwmGetWindowAttribute(ui,DWMWA_EXTENDED_FRAME_BOUNDS,&visible,sizeof(visible))),"composed docking frame");
+        expect((edge!=0 || visible.left==virtualScreen.left) && (edge!=1 || visible.right==virtualScreen.right) && (edge!=2 || visible.top==virtualScreen.top) && (edge!=3 || visible.bottom==virtualScreen.bottom),"actual visible pixels touch each screen edge without a gap");
+    }
+    if(margin.bottom>1){
+        app.resizeScreen.reset();app.resizing=false;app.dpiScreen=virtualScreen;
+        // Simulate a previous theme with no invisible border, then measure the current real frame.
+        app.frameInsets={};app.frameDpi=app.dpi;app.frameMeasured=true;
+        SetWindowPos(ui,nullptr,virtualScreen.left+100,virtualScreen.bottom-height,width,height,SWP_NOZORDER|SWP_NOACTIVATE);
+        SetWindowLongPtrW(ui,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&app));
+        window_proc(ui,WM_THEMECHANGED,0,0);window_proc(ui,FRAME_READY,0,0);DwmFlush();
+        expect(SUCCEEDED(DwmGetWindowAttribute(ui,DWMWA_EXTENDED_FRAME_BOUNDS,&visible,sizeof(visible))) && visible.bottom==virtualScreen.bottom,"theme frame growth preserves the previously docked visible bottom edge");
+        app.dpiScreen.reset();
+    }
+    ShowWindow(ui,SW_HIDE);app.resizing=false;app.resizeScreen.reset();
+    SetWindowPos(ui,nullptr,bottom.left,bottom.top,width,height,SWP_NOZORDER|SWP_NOACTIVATE);app.keep_on_screen();RECT kept;GetWindowRect(ui,&kept);
+    expect(EqualRect(&bottom,&kept)!=FALSE,"releasing a bottom-docked window does not push it up");
+    app.store=Store(executable_dir()+L"\\visible-edge-test-data");SetWindowLongPtrW(ui,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&app));
+    window_proc(ui,WM_ENTERSIZEMOVE,0,0);window_proc(ui,WM_EXITSIZEMOVE,0,0);window_proc(ui,WM_SETTINGCHANGE,SPI_SETWORKAREA,0);GetWindowRect(ui,&kept);
+    expect(EqualRect(&bottom,&kept)!=FALSE,"move completion and taskbar changes preserve visible bottom docking");
+    Store saved(executable_dir()+L"\\visible-edge-test-data");auto geometry=saved.data["window"];
+    RECT restored={geometry["x"].get<LONG>(),geometry["y"].get<LONG>(),geometry["x"].get<LONG>()+geometry["width"].get<LONG>(),geometry["y"].get<LONG>()+geometry["height"].get<LONG>()};
+    app.fit_rect(restored,screen);expect(EqualRect(&bottom,&restored)!=FALSE && restored.bottom-margin.bottom==screen.bottom,"saved bottom docking restores flush to the physical screen");
+    SetWindowLongPtrW(ui,GWLP_USERDATA,0);DestroyWindow(ui);
+}
+static void screen_bounds_regressions(){
+    HWND ui=CreateWindowExW(WS_EX_NOACTIVATE,L"STATIC",L"Screen bounds fixture",WS_POPUP|WS_THICKFRAME,0,0,500,340,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+    expect(ui!=nullptr,"screen bounds fixture window");
+    App sizing;sizing.window=ui;sizing.settings=Settings{};sizing.dpi=GetDpiForWindow(ui);sizing.top=sizing.scale(34);sizing.bottom=sizing.scale(25);
+    sizing.store=Store(executable_dir()+L"\\screen-bounds-test-data");
+    SetWindowLongPtrW(ui,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&sizing));
+    auto nativeProcedure=reinterpret_cast<WNDPROC>(SetWindowLongPtrW(ui,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(window_proc)));
+    expect(nativeProcedure!=nullptr,"native fixture routes nested sizing messages through the app procedure");
+    MONITORINFO info={sizeof(info)};expect(GetMonitorInfoW(MonitorFromWindow(ui,MONITOR_DEFAULTTONEAREST),&info)!=FALSE,"fixture monitor work area");
+    const RECT work=info.rcMonitor;
+    SetWindowPos(ui,nullptr,work.left+20,work.top+20,500,340,SWP_NOZORDER|SWP_NOACTIVATE);
+    window_proc(ui,WM_ENTERSIZEMOVE,0,0);
+    RECT proposed;GetWindowRect(ui,&proposed);proposed.right=work.right+2000;proposed.bottom=work.bottom+2000;
+    window_proc(ui,WM_SIZING,WMSZ_BOTTOMRIGHT,reinterpret_cast<LPARAM>(&proposed));
+    RECT projected=sizing.visible_rect(proposed);expect(projected.left>=work.left && projected.top>=work.top && projected.right<=work.right && projected.bottom<=work.bottom,"resizing past the monitor stops at visible screen bounds");
+    SetWindowPos(ui,nullptr,proposed.left,proposed.top,proposed.right-proposed.left,proposed.bottom-proposed.top,SWP_NOZORDER|SWP_NOACTIVATE);
+    window_proc(ui,WM_EXITSIZEMOVE,0,0);
+    RECT released;GetWindowRect(ui,&released);
+    expect(EqualRect(&proposed,&released)!=FALSE,"releasing a bounded resize does not jump the window");
+    Store saved(executable_dir()+L"\\screen-bounds-test-data");auto geometry=saved.data["window"];
+    expect(geometry["x"]==released.left && geometry["y"]==released.top && geometry["width"]==released.right-released.left && geometry["height"]==released.bottom-released.top,"resize completion saves the final visible geometry");
+    expect(!sizing.resizeScreen && !sizing.resizing,"releasing resize clears the captured monitor");
+    sizing.resizeScreen=RECT{0,0,240,180};sizing.resizing=false;
+    RECT dpiSuggestion=sizing.outer_bounds(work);sizing.constrain_size(WMSZ_BOTTOMRIGHT,dpiSuggestion,&work);
+    MINMAXINFO moveLimits={};SendMessageW(ui,WM_GETMINMAXINFO,0,reinterpret_cast<LPARAM>(&moveLimits));
+    expect(moveLimits.ptMaxTrackSize.x==dpiSuggestion.right-dpiSuggestion.left && moveLimits.ptMaxTrackSize.y==dpiSuggestion.bottom-dpiSuggestion.top,"ordinary moves ignore the departure monitor's tracking limits");
+    struct DpiProbe {App* app;RECT work;int queries=0;bool destinationUsed=true;};DpiProbe probe{&sizing,work};
+    auto probeProcedure=[](HWND hwnd,UINT msg,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR data)->LRESULT{
+        auto probe=reinterpret_cast<DpiProbe*>(data);
+        if(msg==WM_GETMINMAXINFO){++probe->queries;probe->destinationUsed=probe->destinationUsed && probe->app->dpiScreen && EqualRect(&*probe->app->dpiScreen,&probe->work);}
+        return DefSubclassProc(hwnd,msg,w,l);
+    };
+    expect(SetWindowSubclass(ui,probeProcedure,1,reinterpret_cast<DWORD_PTR>(&probe))!=FALSE,"native DPI min/max probe");
+    SendMessageW(ui,WM_DPICHANGED,MAKELONG(sizing.dpi,sizing.dpi),reinterpret_cast<LPARAM>(&dpiSuggestion));GetWindowRect(ui,&released);
+    RemoveWindowSubclass(ui,probeProcedure,1);
+    expect(EqualRect(&dpiSuggestion,&released)!=FALSE,"nested SetWindowPos validation preserves a valid move/DPI size");
+    expect(probe.queries>0 && probe.destinationUsed && !sizing.dpiScreen,"native reentrant min/max validation uses the transient destination work area and clears it afterward");
+    sizing.resizeScreen.reset();
+    for(UINT edge:{WMSZ_LEFT,WMSZ_RIGHT,WMSZ_TOP,WMSZ_BOTTOM,WMSZ_TOPLEFT,WMSZ_TOPRIGHT,WMSZ_BOTTOMLEFT,WMSZ_BOTTOMRIGHT}){
+        SetWindowPos(ui,nullptr,work.left+20,work.top+20,500,340,SWP_NOZORDER|SWP_NOACTIVATE);
+        window_proc(ui,WM_ENTERSIZEMOVE,0,0);RECT request;GetWindowRect(ui,&request);
+        if(edge==WMSZ_LEFT || edge==WMSZ_TOPLEFT || edge==WMSZ_BOTTOMLEFT)request.left=work.left-2000;else if(edge!=WMSZ_TOP && edge!=WMSZ_BOTTOM)request.right=work.right+2000;
+        if(edge==WMSZ_TOP || edge==WMSZ_TOPLEFT || edge==WMSZ_TOPRIGHT)request.top=work.top-2000;else if(edge==WMSZ_BOTTOM || edge==WMSZ_BOTTOMLEFT || edge==WMSZ_BOTTOMRIGHT)request.bottom=work.bottom+2000;
+        window_proc(ui,WM_SIZING,edge,reinterpret_cast<LPARAM>(&request));
+        projected=sizing.visible_rect(request);expect(projected.left>=work.left && projected.top>=work.top && projected.right<=work.right && projected.bottom<=work.bottom,"every native resize edge respects the visible monitor boundary");
+        SetWindowPos(ui,nullptr,request.left,request.top,request.right-request.left,request.bottom-request.top,SWP_NOZORDER|SWP_NOACTIVATE);
+        window_proc(ui,WM_EXITSIZEMOVE,0,0);GetWindowRect(ui,&released);
+        expect(EqualRect(&request,&released)!=FALSE,"every constrained edge stays stationary on release");
+    }
+    // Recover oversized legacy geometry without independently clipping width and height.
+    SetWindowPos(ui,nullptr,work.left-100,work.top-100,(work.right-work.left)*2,(work.bottom-work.top)*2,SWP_NOZORDER|SWP_NOACTIVATE);
+    sizing.dpi=GetDpiForWindow(ui);sizing.top=sizing.scale(34);sizing.bottom=sizing.scale(25);RECT recovery=sizing.screen_area();
+    sizing.keep_on_screen();GetWindowRect(ui,&released);
+    projected=sizing.visible_rect(released);expect(projected.left>=recovery.left && projected.top>=recovery.top && projected.right<=recovery.right && projected.bottom<=recovery.bottom,"oversized old windows recover within visible screen bounds");
+    RECT client;GetClientRect(ui,&client);
+    expect(std::abs(client.right*9-(client.bottom-sizing.top-sizing.bottom)*16)<=8,"oversized recovery preserves the actual video aspect");
+    sizing.keep_on_screen();RECT stable;GetWindowRect(ui,&stable);expect(EqualRect(&released,&stable)!=FALSE,"recovery is idempotent");
+    sizing.resizeScreen=RECT{-5000,-5000,5000,5000};sizing.resizing=true;window_proc(ui,WM_SETTINGCHANGE,SPI_SETWORKAREA,0);
+    RECT changed=sizing.screen_area();expect(sizing.resizeScreen && EqualRect(&*sizing.resizeScreen,&changed)!=FALSE,"work-area changes replace stale taskbar bounds");
+    window_proc(ui,WM_DISPLAYCHANGE,0,0);expect(!sizing.resizeScreen && !sizing.resizing,"display changes discard disconnected monitor bounds");
+    SetWindowLongPtrW(ui,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(nativeProcedure));SetWindowLongPtrW(ui,GWLP_USERDATA,0);DestroyWindow(ui);
+    std::cout<<"PASS native visible screen bounds and stable saved position\n";
+}
+static void bounded_resize_geometry_regressions(){
+    const DWORD style=WS_POPUP|WS_THICKFRAME;
+    HWND ui=CreateWindowExW(WS_EX_NOACTIVATE,L"STATIC",L"Bounded geometry fixture",style,0,0,500,340,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+    expect(ui!=nullptr,"bounded geometry fixture");App sizing;sizing.window=ui;sizing.settings=Settings{};
+    SetWindowLongPtrW(ui,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&sizing));
+    auto inside=[&](const RECT& rect,const RECT& work){RECT visible=sizing.visible_rect(rect);return visible.right>visible.left && visible.bottom>visible.top && visible.left>=work.left && visible.top>=work.top && visible.right<=work.right && visible.bottom<=work.bottom;};
+    int cases=0;
+    for(UINT dpi:{96u,120u,144u,168u,192u})for(bool menuVisible:{true,false}){
+        sizing.dpi=dpi;sizing.settings.menu_bar_visible=menuVisible;sizing.top=menuVisible?sizing.scale(34):0;sizing.bottom=sizing.scale(25);
+        RECT frame={};expect(AdjustWindowRectExForDpi(&frame,style,FALSE,WS_EX_NOACTIVATE,dpi)!=FALSE,"bounded fixture frame");
+        LONG frameWidth=frame.right-frame.left,overhead=frame.bottom-frame.top+sizing.top+sizing.bottom;
+        for(const RECT& work:std::vector<RECT>{{0,40,1920,1040},{-1920,0,0,1040},{40,-1280,1440,-40},{0,0,240,180},{0,0,24,60}}){
+            sizing.resizeScreen=work;sizing.resizing=false;
+            RECT base={work.left+20,work.top+20,work.left+20+sizing.scale(480),work.top+20+sizing.scale(270)+overhead};
+            sizing.constrain_size(WMSZ_BOTTOMRIGHT,base,&work);expect(inside(base,work),"initial bounded geometry fits even smaller work areas");
+            sizing.resizing=true;MINMAXINFO limits={};window_proc(ui,WM_GETMINMAXINFO,0,reinterpret_cast<LPARAM>(&limits));
+            RECT allowed=sizing.outer_bounds(work);expect(limits.ptMaxTrackSize.x<=allowed.right-allowed.left && limits.ptMaxTrackSize.y<=allowed.bottom-allowed.top && limits.ptMinTrackSize.x>0 && limits.ptMinTrackSize.y>0 && limits.ptMinTrackSize.x<=limits.ptMaxTrackSize.x && limits.ptMinTrackSize.y<=limits.ptMaxTrackSize.y,"tracking minima and maxima include only invisible frame overflow");
+            for(UINT edge:{WMSZ_LEFT,WMSZ_RIGHT,WMSZ_TOP,WMSZ_BOTTOM,WMSZ_TOPLEFT,WMSZ_TOPRIGHT,WMSZ_BOTTOMLEFT,WMSZ_BOTTOMRIGHT}){
+                bool left=edge==WMSZ_LEFT || edge==WMSZ_TOPLEFT || edge==WMSZ_BOTTOMLEFT,upper=edge==WMSZ_TOP || edge==WMSZ_TOPLEFT || edge==WMSZ_TOPRIGHT;
+                RECT request=base;
+                if(edge!=WMSZ_TOP && edge!=WMSZ_BOTTOM){if(left)request.left=work.left-5000;else request.right=work.right+5000;}
+                if(upper)request.top=work.top-5000;else if(edge==WMSZ_BOTTOM || edge==WMSZ_BOTTOMLEFT || edge==WMSZ_BOTTOMRIGHT)request.bottom=work.bottom+5000;
+                RECT extreme=request;window_proc(ui,WM_SIZING,edge,reinterpret_cast<LPARAM>(&request));++cases;
+                expect(inside(request,work),"outward resizing remains inside the original monitor including negative origins");
+                expect((left?request.right==base.right:request.left==base.left) && (upper?request.bottom==base.bottom:request.top==base.top),"hitting the monitor boundary keeps the stationary edges fixed");
+                if(work.right-work.left>frameWidth && work.bottom-work.top>overhead)expect(std::abs((request.right-request.left-frameWidth)*9-(request.bottom-request.top-overhead)*16)<=8,"screen limits preserve 16:9 at every DPI and menu state");
+                for(int repeat=0;repeat<4;++repeat){RECT next=extreme;window_proc(ui,WM_SIZING,edge,reinterpret_cast<LPARAM>(&next));expect(EqualRect(&next,&request)!=FALSE,"continued outward dragging does not drift or change monitors");}
+                RECT back=base;window_proc(ui,WM_SIZING,edge,reinterpret_cast<LPARAM>(&back));
+                expect(inside(back,work) && back.right-back.left<=base.right-base.left+1 && back.bottom-back.top<=base.bottom-base.top+1,"dragging inward after the boundary can shrink again");
+                expect(sizing.resizeScreen && EqualRect(&*sizing.resizeScreen,&work)!=FALSE,"oversized candidates cannot select an adjacent monitor");
+            }
+            RECT old={work.left-100,work.top-100,work.right+3000,work.bottom+3000};sizing.fit_rect(old,work);expect(inside(old,work),"restored oversized geometry is fitted to the same work area");
+        }
+    }
+    sizing.resizeScreen=RECT{-1920,0,0,1040};sizing.resizing=true;
+    RECT suggested={100,100,5000,4000};window_proc(ui,WM_DPICHANGED,MAKELONG(144,144),reinterpret_cast<LPARAM>(&suggested));RECT applied;GetWindowRect(ui,&applied);
+    expect(inside(applied,*sizing.resizeScreen),"DPI changes during resize retain the captured monitor boundary");
+    sizing.resizing=false;sizing.dpiScreen=RECT{0,0,240,180};MINMAXINFO destinationLimits={};window_proc(ui,WM_GETMINMAXINFO,0,reinterpret_cast<LPARAM>(&destinationLimits));
+    RECT destination=sizing.outer_bounds(*sizing.dpiScreen);expect(destinationLimits.ptMaxTrackSize.x<=destination.right-destination.left && destinationLimits.ptMaxTrackSize.y<=destination.bottom-destination.top,"DPI validation uses destination bounds independently of the HWND's old monitor");sizing.dpiScreen.reset();
+    SetWindowLongPtrW(ui,GWLP_USERDATA,0);DestroyWindow(ui);
+    std::cout<<"PASS "<<cases<<" bounded edge/DPI/menu/work-area cases\n";
+}
 static void resize_regressions(){
     const DWORD style=WS_POPUP|WS_THICKFRAME,extended=WS_EX_NOACTIVATE|WS_EX_APPWINDOW;
     HWND ui=CreateWindowExW(extended,L"STATIC",L"Resize fixture",style,0,0,640,480,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
     expect(ui!=nullptr,"resize fixture window");
     App sizing;sizing.window=ui;sizing.settings=Settings{};
+    // These geometry cases describe a virtual desktop, independent of the test machine's monitors.
+    sizing.resizeScreen=RECT{-5000,-5000,5000,5000};
     SetWindowLongPtrW(ui,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&sizing));
     for(UINT dpi:{96u,144u,192u})for(bool menuVisible:{true,false}){
         sizing.dpi=dpi;sizing.settings.menu_bar_visible=menuVisible;sizing.top=menuVisible?sizing.scale(34):0;sizing.bottom=sizing.scale(25);
@@ -59,6 +214,9 @@ int main(){
     INITCOMMONCONTROLSEX controls={sizeof(controls),ICC_STANDARD_CLASSES|ICC_WIN95_CLASSES};InitCommonControlsEx(&controls);
     HWND host=CreateWindowExW(0,L"STATIC",L"Controller test",WS_POPUP,0,0,480,320,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
     try{
+        visible_edge_docking_regressions();
+        screen_bounds_regressions();
+        bounded_resize_geometry_regressions();
         resize_regressions();
         expect(write_settings(read_settings({{"menu_bar_visible",false}})).value("menu_bar_visible",true)==false,"hidden menu bar survives settings roundtrip");
         expect(write_settings(read_settings(json::object())).value("menu_bar_visible",false),"legacy settings show the menu bar by default");
