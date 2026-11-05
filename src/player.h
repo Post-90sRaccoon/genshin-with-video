@@ -3,7 +3,7 @@
 #include <functional>
 #include <mpv/client.h>
 namespace gv {
-struct Snapshot {bool loaded=false,paused=true,eof=false,position_valid=false,seeking=false;double position=0,duration=0;int height=0,position_status=MPV_ERROR_PROPERTY_UNAVAILABLE;int64_t entry_id=-1;long long source_deadline=0;std::string audio_codec,hwdec,error;};
+struct Snapshot {bool loaded=false,paused=true,eof=false,position_valid=false,seeking=false;double position=0,duration=0,speed=1.0;int height=0,position_status=MPV_ERROR_PROPERTY_UNAVAILABLE;int64_t entry_id=-1;long long source_deadline=0;std::string audio_codec,hwdec,error;};
 struct SourceOptions {std::wstring yt_dlp,cookies;int max_height=720;};
 class Player {
     HMODULE library_=nullptr;mpv_handle* handle_=nullptr;std::function<void()> wake_;
@@ -34,7 +34,7 @@ public:
     bool initialized() const {return handle_!=nullptr;}
     void load(const Media& media,double start,bool paused,const std::string& title);
     void load_url(const std::string& url,double start,bool paused,const std::string& title);
-    void stop();void set_pause(bool paused);void seek(double delta);void volume(double value);
+    void stop();void set_pause(bool paused);void seek(double delta);void volume(double value);void set_speed(double value);
     void drain();Snapshot snapshot();void shutdown();
 };
 }
