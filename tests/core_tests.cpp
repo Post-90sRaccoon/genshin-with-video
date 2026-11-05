@@ -43,6 +43,16 @@ int main() {
         check(clamp_seek(2,-5,100)==0,"seek start clamp");
         check(clamp_seek(98,5,100)==100,"seek end clamp");
         check(clamp_seek(20,-5,100)==15,"relative seek");
+        check(stream_deadline("https://cdn.test/v?x=1&deadline=1793856353&token=hidden")==1793856353,"read the signed stream expiry");
+        check(stream_deadline("https://cdn.test/v?xdeadline=1793856353")==0,"expiry must be an exact query key");
+        check(stream_deadline("https://cdn.test/v#?deadline=1793856353")==0,"a fragment is not an expiry query");
+        check(stream_deadline("https://cdn.test/v?deadline=-1")==0,"ignore negative expiry");
+        check(stream_deadline("https://cdn.test/v?deadline=1793856353x")==0,"ignore malformed expiry");
+        check(stream_deadline("https://cdn.test/v?deadline=9999999999999999999999999")==0,"ignore overflowing expiry");
+        json extracted={{"formats",json::array({{{"url","https://cdn.test/unused?deadline=1"}}})},{"requested_formats",json::array({{{"url","https://cdn.test/video?deadline=1793856353"}},{{"url","https://cdn.test/audio?deadline=1793856253"}}})}};
+        check(extraction_deadline(extracted)==1793856253,"renew before the earliest selected audio or video expires");
+        check(extraction_deadline({{"url","https://cdn.test/muxed?deadline=1793856353"}})==1793856353,"progressive stream expiry");
+        check(extraction_deadline({{"requested_formats",nullptr}})==0,"missing expiry leaves local and unsigned media alone");
         std::cout << "PASS " << count << " core assertions\n";
     } catch(const std::exception& e) { std::cerr<<"FAIL: "<<e.what()<<"\n"; return 1; }
 }

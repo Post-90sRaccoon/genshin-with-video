@@ -1,9 +1,12 @@
 #pragma once
 #include <string>
 #include <vector>
+#include <array>
 #include "json.hpp"
 namespace gv {
 using json = nlohmann::json;
+constexpr std::array<double,7> PLAYBACK_SPEEDS={{0.5,0.75,1.0,1.25,1.5,1.75,2.0}};
+bool valid_playback_speed(double value);
 struct VideoRef {
     std::string bvid; int page=0; bool short_url=false; std::string original;
     std::string url() const;
@@ -20,4 +23,6 @@ VideoRef parse_video_url(const std::string& input);
 Media select_media(const json& info,int max_height);
 Resume choose_resume(const VideoRef& ref,const json& history,const std::vector<Part>& parts);
 double clamp_seek(double position,double delta,double duration);
+long long stream_deadline(const std::string& url);
+long long extraction_deadline(const json& info);
 }

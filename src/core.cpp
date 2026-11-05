@@ -4,6 +4,9 @@
 #include <cmath>
 #include <tuple>
 namespace gv {
+bool valid_playback_speed(double value) {
+    return std::isfinite(value) && std::find(PLAYBACK_SPEEDS.begin(),PLAYBACK_SPEEDS.end(),value)!=PLAYBACK_SPEEDS.end();
+}
 std::string VideoRef::url() const {
     if(short_url) return original;
     return "https://www.bilibili.com/video/"+bvid+"/"+(page ? "?p="+std::to_string(page):"");
@@ -98,5 +101,36 @@ double clamp_seek(double position,double delta,double duration) {
     if(!std::isfinite(position)) position=0;
     double target=std::max(0.0,position+delta);
     return duration>0?std::min(target,duration):target;
+}
+long long stream_deadline(const std::string& url) {
+    auto query=url.find('?'),fragment=url.find('#');
+    if(query==std::string::npos || (fragment!=std::string::npos && fragment<query))return 0;
+    auto end=fragment==std::string::npos?url.size():fragment;
+    long long deadline=0;
+    for(auto offset=query+1;offset<end;){
+        auto next=url.find('&',offset);if(next==std::string::npos || next>end)next=end;
+        auto field=url.substr(offset,next-offset);
+        if(field.compare(0,9,"deadline=")==0){
+            auto value=field.substr(9);
+            if(!value.empty() && value.find_first_not_of("0123456789")==std::string::npos){
+                try{auto parsed=std::stoll(value);if(parsed>0 && (!deadline || parsed<deadline))deadline=parsed;}catch(const std::exception&){}
+            }
+        }
+        offset=next+1;
+    }
+    return deadline;
+}
+long long extraction_deadline(const json& info) {
+    if(!info.is_object())return 0;
+    long long deadline=0;
+    auto include=[&](const json& format){
+        if(!format.is_object())return;
+        auto value=stream_deadline(string(format,"url"));
+        if(value>0 && (!deadline || value<deadline))deadline=value;
+    };
+    auto formats=info.find("requested_formats");
+    if(formats!=info.end() && formats->is_array())for(const auto& format:*formats)include(format);
+    else include(info);
+    return deadline;
 }
 }
