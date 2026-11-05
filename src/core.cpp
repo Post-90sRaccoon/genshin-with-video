@@ -4,6 +4,9 @@
 #include <cmath>
 #include <tuple>
 namespace gv {
+bool valid_playback_speed(double value) {
+    return std::isfinite(value) && std::find(PLAYBACK_SPEEDS.begin(),PLAYBACK_SPEEDS.end(),value)!=PLAYBACK_SPEEDS.end();
+}
 std::string VideoRef::url() const {
     if(short_url) return original;
     return "https://www.bilibili.com/video/"+bvid+"/"+(page ? "?p="+std::to_string(page):"");

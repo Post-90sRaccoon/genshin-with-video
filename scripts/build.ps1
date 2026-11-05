@@ -7,7 +7,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path $root 'build') | Out-Null
 $vcvars = Join-Path $vs 'VC/Auxiliary/Build/vcvars64.bat'
 $flags = '/nologo /std:c++17 /EHsc /utf-8 /W4 /O2 /MP2 /MT /DUNICODE /D_UNICODE /DNOMINMAX /DWIN32_LEAN_AND_MEAN /D_WIN32_WINNT=0x0A00 /I..\third_party\include /I..\third_party\mpv\include /I..\src'
 if ($ControllerOnly) {
-    $commands=@('@echo off',('call "'+$vcvars+'" >nul'),('cd /d "'+(Join-Path $root 'build')+'"'),('cl '+$flags+' ..\tests\app_tests.cpp core.obj platform.obj source.obj player.obj dialogs.obj /Fe:app_tests.exe /link /SUBSYSTEM:CONSOLE user32.lib gdi32.lib comctl32.lib comdlg32.lib shell32.lib winhttp.lib ole32.lib'),'if errorlevel 1 exit /b 1','app_tests.exe','exit /b %errorlevel%')
+    $commands=@('@echo off',('call "'+$vcvars+'" >nul'),('cd /d "'+(Join-Path $root 'build')+'"'),'rc /nologo /fo app.res ..\src\app.rc','if errorlevel 1 exit /b 1',('cl '+$flags+' ..\tests\app_tests.cpp core.obj platform.obj source.obj player.obj dialogs.obj app.res /Fe:app_tests.exe /link /SUBSYSTEM:CONSOLE user32.lib gdi32.lib comctl32.lib comdlg32.lib shell32.lib winhttp.lib ole32.lib'),'if errorlevel 1 exit /b 1','app_tests.exe','exit /b %errorlevel%')
     $controllerScript=Join-Path $root 'build/controller-tests.cmd'
     [IO.File]::WriteAllLines($controllerScript,$commands,[Text.Encoding]::Default)
     & cmd.exe /d /c $controllerScript
@@ -16,8 +16,9 @@ if ($ControllerOnly) {
 }
 $lines = @('@echo off',('call "' + $vcvars + '" >nul'),('cd /d "' + (Join-Path $root 'build') + '"'),('cl ' + $flags + ' ..\tests\core_tests.cpp ..\src\core.cpp /Fe:core_tests.exe'), 'if errorlevel 1 exit /b 1', 'core_tests.exe', 'if errorlevel 1 exit /b 1')
 if (!$TestOnly) {
-    if (!$IntegrationOnly) { $lines += @('rc /nologo /fo app.res ..\src\app.rc','if errorlevel 1 exit /b 1',('cl ' + $flags + ' ..\src\main.cpp ..\src\core.cpp ..\src\platform.cpp ..\src\source.cpp ..\src\player.cpp ..\src\dialogs.cpp app.res /Fe:GenshinVideo.exe /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib comctl32.lib comdlg32.lib shell32.lib winhttp.lib ole32.lib dwmapi.lib'), 'if errorlevel 1 exit /b 1') }
-    $lines += @(('cl ' + $flags + ' ..\tests\integration.cpp ..\src\core.cpp ..\src\platform.cpp ..\src\source.cpp ..\src\player.cpp /Fe:integration.exe /link /SUBSYSTEM:CONSOLE user32.lib gdi32.lib winhttp.lib shell32.lib ole32.lib'), 'if errorlevel 1 exit /b 1','integration.exe','if errorlevel 1 exit /b 1',('cl ' + $flags + ' ..\tests\app_tests.cpp ..\src\core.cpp ..\src\platform.cpp ..\src\source.cpp ..\src\player.cpp ..\src\dialogs.cpp /Fe:app_tests.exe /link /SUBSYSTEM:CONSOLE user32.lib gdi32.lib comctl32.lib comdlg32.lib shell32.lib winhttp.lib ole32.lib'),'if errorlevel 1 exit /b 1','app_tests.exe','if errorlevel 1 exit /b 1')
+    $lines += @('rc /nologo /fo app.res ..\src\app.rc','if errorlevel 1 exit /b 1')
+    if (!$IntegrationOnly) { $lines += @(('cl ' + $flags + ' ..\src\main.cpp ..\src\core.cpp ..\src\platform.cpp ..\src\source.cpp ..\src\player.cpp ..\src\dialogs.cpp app.res /Fe:GenshinVideo.exe /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib comctl32.lib comdlg32.lib shell32.lib winhttp.lib ole32.lib dwmapi.lib'), 'if errorlevel 1 exit /b 1') }
+    $lines += @(('cl ' + $flags + ' ..\tests\integration.cpp ..\src\core.cpp ..\src\platform.cpp ..\src\source.cpp ..\src\player.cpp /Fe:integration.exe /link /SUBSYSTEM:CONSOLE user32.lib gdi32.lib winhttp.lib shell32.lib ole32.lib'), 'if errorlevel 1 exit /b 1','integration.exe','if errorlevel 1 exit /b 1',('cl ' + $flags + ' ..\tests\app_tests.cpp ..\src\core.cpp ..\src\platform.cpp ..\src\source.cpp ..\src\player.cpp ..\src\dialogs.cpp app.res /Fe:app_tests.exe /link /SUBSYSTEM:CONSOLE user32.lib gdi32.lib comctl32.lib comdlg32.lib shell32.lib winhttp.lib ole32.lib'),'if errorlevel 1 exit /b 1','app_tests.exe','if errorlevel 1 exit /b 1')
 }
 $lines += 'exit /b 0'
 $cmdFile = Join-Path $root 'build/compile.cmd'

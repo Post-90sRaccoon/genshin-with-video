@@ -28,7 +28,7 @@ void Player::initialize(HWND window,const std::wstring& dll,std::function<void()
         opt("ytdl-format","bestvideo"+bound+"[vcodec^=avc1]+bestaudio/bestvideo"+bound+"+bestaudio/best"+bound);
     }
     opt("wid",std::to_string(reinterpret_cast<intptr_t>(window)));opt("vo","gpu");opt("gpu-api","d3d11");opt("hwdec","auto");opt("keep-open","yes");opt("idle","yes");opt("force-window","yes");opt("pause","yes");
-    opt("cache","yes");opt("demuxer-max-bytes","16MiB");opt("demuxer-max-back-bytes","8MiB");opt("demuxer-readahead-secs","15");opt("cache-pause-wait","1");opt("network-timeout","10");opt("volume","35");opt("msg-level","all=no");
+    opt("cache","yes");opt("demuxer-max-bytes","16MiB");opt("demuxer-max-back-bytes","8MiB");opt("demuxer-readahead-secs","15");opt("cache-pause-wait","1");opt("network-timeout","10");opt("volume","35");opt("audio-pitch-correction","yes");opt("msg-level","all=no");
     check(initialize_(handle_));wake_=std::move(wake);callback_(handle_,&Player::wakeup,this);
 }
 void Player::load(const Media& media,double start,bool paused,const std::string& title){load_internal(media,start,paused,title,false);}
@@ -59,6 +59,7 @@ void Player::stop(){expected_entry_=-1;loaded_=false;source_deadline_=0;error_.c
 void Player::set_pause(bool paused){if(handle_){int b=paused?1:0;check(set_(handle_,"pause",MPV_FORMAT_FLAG,&b));}}
 void Player::seek(double delta){if(handle_){auto s=snapshot();if(!s.loaded || !s.position_valid)return;auto target=std::to_string(clamp_seek(s.position,delta,s.duration));const char* args[]={"seek",target.c_str(),"absolute+exact",nullptr};check(command_(handle_,args));}}
 void Player::volume(double value){if(handle_)check(set_(handle_,"volume",MPV_FORMAT_DOUBLE,&value));}
+void Player::set_speed(double value){if(!valid_playback_speed(value))throw std::runtime_error("播放速度无效");if(handle_)check(set_(handle_,"speed",MPV_FORMAT_DOUBLE,&value));}
 std::string Player::text(const char* property){char* p=string_(handle_,property);if(!p)return "";std::string result(p);free_(p);return result;}
 void Player::drain(){if(!handle_)return;while(auto e=event_(handle_,0)){
     if(e->event_id==MPV_EVENT_NONE)break;
@@ -76,6 +77,6 @@ void Player::drain(){if(!handle_)return;while(auto e=event_(handle_,0)){
     }
     if(e->event_id==MPV_EVENT_END_FILE){auto end=static_cast<mpv_event_end_file*>(e->data);if(end && end->playlist_entry_id==expected_entry_ && expected_entry_>=0){loaded_=false;if(end->reason==MPV_END_FILE_REASON_ERROR)error_=std::string("媒体连接失败：")+error_string_(end->error);}}
 }}
-Snapshot Player::snapshot(){Snapshot s;s.loaded=loaded_;s.error=error_;s.entry_id=expected_entry_;s.source_deadline=source_deadline_;if(!handle_)return s;int value=1;get_(handle_,"pause",MPV_FORMAT_FLAG,&value);s.paused=value!=0;value=0;get_(handle_,"eof-reached",MPV_FORMAT_FLAG,&value);s.eof=value!=0;value=0;get_(handle_,"seeking",MPV_FORMAT_FLAG,&value);s.seeking=value!=0;s.position_status=get_(handle_,"time-pos",MPV_FORMAT_DOUBLE,&s.position);s.position_valid=s.loaded && s.position_status>=0 && std::isfinite(s.position) && s.position>=0;get_(handle_,"duration",MPV_FORMAT_DOUBLE,&s.duration);int64_t height=0;get_(handle_,"video-params/h",MPV_FORMAT_INT64,&height);s.height=static_cast<int>(height);s.audio_codec=text("audio-codec-name");s.hwdec=text("hwdec-current");return s;}
+Snapshot Player::snapshot(){Snapshot s;s.loaded=loaded_;s.error=error_;s.entry_id=expected_entry_;s.source_deadline=source_deadline_;if(!handle_)return s;int value=1;get_(handle_,"pause",MPV_FORMAT_FLAG,&value);s.paused=value!=0;value=0;get_(handle_,"eof-reached",MPV_FORMAT_FLAG,&value);s.eof=value!=0;value=0;get_(handle_,"seeking",MPV_FORMAT_FLAG,&value);s.seeking=value!=0;s.position_status=get_(handle_,"time-pos",MPV_FORMAT_DOUBLE,&s.position);s.position_valid=s.loaded && s.position_status>=0 && std::isfinite(s.position) && s.position>=0;get_(handle_,"duration",MPV_FORMAT_DOUBLE,&s.duration);get_(handle_,"speed",MPV_FORMAT_DOUBLE,&s.speed);int64_t height=0;get_(handle_,"video-params/h",MPV_FORMAT_INT64,&height);s.height=static_cast<int>(height);s.audio_codec=text("audio-codec-name");s.hwdec=text("hwdec-current");return s;}
 void Player::shutdown(){if(handle_){if(callback_)callback_(handle_,nullptr,nullptr);if(destroy_)destroy_(handle_);handle_=nullptr;}wake_={};if(library_){FreeLibrary(library_);library_=nullptr;}loaded_=false;source_deadline_=0;expected_entry_=active_entry_=-1;error_.clear();}
 }
