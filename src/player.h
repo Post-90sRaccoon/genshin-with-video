@@ -3,11 +3,11 @@
 #include <functional>
 #include <mpv/client.h>
 namespace gv {
-struct Snapshot {bool loaded=false,paused=true,eof=false,position_valid=false,seeking=false;double position=0,duration=0;int height=0,position_status=MPV_ERROR_PROPERTY_UNAVAILABLE;int64_t entry_id=-1;std::string audio_codec,hwdec,error;};
+struct Snapshot {bool loaded=false,paused=true,eof=false,position_valid=false,seeking=false;double position=0,duration=0;int height=0,position_status=MPV_ERROR_PROPERTY_UNAVAILABLE;int64_t entry_id=-1;long long source_deadline=0;std::string audio_codec,hwdec,error;};
 struct SourceOptions {std::wstring yt_dlp,cookies;int max_height=720;};
 class Player {
     HMODULE library_=nullptr;mpv_handle* handle_=nullptr;std::function<void()> wake_;
-    bool loaded_=false;int64_t expected_entry_=-1,active_entry_=-1;std::string error_;
+    bool loaded_=false,parse_url_=false;int64_t expected_entry_=-1,active_entry_=-1;long long source_deadline_=0;std::string error_;
     decltype(&mpv_create) create_=nullptr;
     decltype(&mpv_initialize) initialize_=nullptr;
     decltype(&mpv_set_option_string) option_=nullptr;

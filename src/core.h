@@ -20,4 +20,6 @@ VideoRef parse_video_url(const std::string& input);
 Media select_media(const json& info,int max_height);
 Resume choose_resume(const VideoRef& ref,const json& history,const std::vector<Part>& parts);
 double clamp_seek(double position,double delta,double duration);
+long long stream_deadline(const std::string& url);
+long long extraction_deadline(const json& info);
 }
