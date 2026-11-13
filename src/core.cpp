@@ -7,6 +7,50 @@ namespace gv {
 bool valid_playback_speed(double value) {
     return std::isfinite(value) && std::find(PLAYBACK_SPEEDS.begin(),PLAYBACK_SPEEDS.end(),value)!=PLAYBACK_SPEEDS.end();
 }
+VideoInputState read_video_input(const json& cache,double audio_position) {
+    if(!cache.is_object() || !std::isfinite(audio_position) || audio_position<0)return {};
+    auto eof=cache.find("eof"),streams=cache.find("ts-per-stream");
+    if(eof==cache.end() || !eof->is_boolean() || streams==cache.end() || !streams->is_array())return {};
+    const json* video=nullptr;
+    for(const auto& stream:*streams){
+        if(!stream.is_object())return {};
+        auto type=stream.find("type");
+        if(type==stream.end() || !type->is_string())return {};
+        if(*type!="video")continue;
+        if(video)return {};
+        video=&stream;
+    }
+    if(!video)return {};
+    auto end=video->find("cache-end"),remaining=video->find("cache-duration");
+    if(end==video->end() || !end->is_number() || remaining==video->end() || !remaining->is_number())return {};
+    double video_end=end->get<double>(),video_remaining=remaining->get<double>();
+    if(!std::isfinite(video_end) || video_end<0 || !std::isfinite(video_remaining) || video_remaining<0)return {};
+    return {true,eof->get<bool>(),video_end,video_remaining,audio_position};
+}
+bool premature_video_eof(const VideoInputState& input,double position,double duration) {
+    if(!input.valid || !input.reader_eof || !std::isfinite(position) || position<=0 ||
+        !std::isfinite(duration) || duration<=0 || !std::isfinite(input.video_end) || input.video_end<=0 ||
+        !std::isfinite(input.video_remaining) || input.video_remaining<0 ||
+        !std::isfinite(input.audio_position) || input.audio_position<0)return false;
+    // A short video outro and complete cached EOF are normal; require audio to
+    // have passed the final video packets before classifying a drained input.
+    return position<=duration+1.0 && input.audio_position<=duration+1.0 &&
+        duration-input.video_end>std::max(5.0,duration*0.01) && input.video_remaining<=0.25 &&
+        input.audio_position>input.video_end+0.5 && position>=input.video_end-0.5;
+}
+bool damaged_video_input(const VideoInputState& input,double position,double duration) {
+    if(!input.valid || !input.reader_eof || !std::isfinite(position) || position<=0 ||
+        !std::isfinite(duration) || duration<=0 || !std::isfinite(input.video_end) || input.video_end<=0 ||
+        !std::isfinite(input.video_remaining) || input.video_remaining<0 ||
+        !std::isfinite(input.audio_position) || input.audio_position<0)return false;
+    // Packet reading and decoding may lead the playhead; allow a generous
+    // five-second difference, but reject stale EOF observations after a seek.
+    // A truncated reader can be renewed while its valid buffered tail plays.
+    return position<=duration+1.0 && input.audio_position<=duration+1.0 &&
+        duration-input.video_end>std::max(5.0,duration*0.01) &&
+        input.video_remaining<=input.video_end+0.5 &&
+        position>=input.video_end-input.video_remaining-5.0;
+}
 std::string VideoRef::url() const {
     if(short_url) return original;
     return "https://www.bilibili.com/video/"+bvid+"/"+(page ? "?p="+std::to_string(page):"");
@@ -53,7 +97,7 @@ Media select_media(const json& info,int max_height) {
         if(url.compare(0,8,"https://") && url.compare(0,7,"http://")) continue;
         auto vc=string(f,"vcodec"), ac=string(f,"acodec");
         int height=static_cast<int>(number(f,"height"));
-        if(vc!="none" && height>0 && height<=max_height && number(f,"fps",30)<=30.1) {
+        if(vc!="none" && height>0 && height<=max_height && number(f,"fps",30)<=MAX_VIDEO_FPS) {
             int codec=(vc.find("avc")==0 || vc.find("h264")==0)?3:(vc.find("hev")==0 || vc.find("hvc")==0)?2:1;
             auto score=std::make_tuple(height,codec,number(f,"fps",30));
             if(score>best) {best=score;video=&f;}

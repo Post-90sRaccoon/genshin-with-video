@@ -210,10 +210,196 @@ static void resize_regressions(){
     SetWindowLongPtrW(ui,GWLP_USERDATA,0);DestroyWindow(ui);
     std::cout<<"PASS edge/corner resize, minimum bounds and DPI/menu variants\n";
 }
+static void premature_video_fixture(HWND host){
+    auto u32=[](unsigned value){return std::string(reinterpret_cast<const char*>(&value),4);};
+    auto u16=[](unsigned short value){return std::string(reinterpret_cast<const char*>(&value),2);};
+    auto chunk=[&](const char* tag,const std::string& data){auto result=std::string(tag,4)+u32(static_cast<unsigned>(data.size()))+data;if(data.size()%2)result+='\0';return result;};
+    auto list=[&](const char* tag,const std::string& data){return chunk("LIST",std::string(tag,4)+data);};
+    std::string avih;for(unsigned value:{100000u,7680u,0u,16u,100u,0u,1u,768u,16u,16u,0u,0u,0u,0u})avih+=u32(value);
+    std::string strh="vidsDIB ";strh+=u32(0)+u16(0)+u16(0);for(unsigned value:{0u,1u,10u,0u,100u,768u,0xffffffffu,0u})strh+=u32(value);strh+=u16(0)+u16(0)+u16(16)+u16(16);
+    std::string strf=u32(40)+u32(16)+u32(16)+u16(1)+u16(24);for(unsigned value:{0u,768u,0u,0u,0u,0u})strf+=u32(value);
+    std::string frames,index;for(unsigned i=0;i<100;++i){index+="00db";index+=u32(16)+u32(static_cast<unsigned>(frames.size())+4)+u32(768);frames+=chunk("00db",std::string(768,static_cast<char>(i*2)));}
+    auto header=std::string("AVI ")+list("hdrl",chunk("avih",avih)+list("strl",chunk("strh",strh)+chunk("strf",strf)));
+    auto body=header+list("movi",frames)+chunk("idx1",index);auto full=std::string("RIFF")+u32(static_cast<unsigned>(body.size()))+body;
+    auto good=executable_dir()+L"\\video-complete.avi",bad=executable_dir()+L"\\video-truncated.avi",audio=executable_dir()+L"\\video-recovery-audio.wav";
+    {std::ofstream file(good,std::ios::binary);file.write(full.data(),full.size());}
+    {std::ofstream file(bad,std::ios::binary);auto cut=12+header.size()+12+20*(8+768);file.write(full.data(),cut);}
+    {std::ofstream file(audio,std::ios::binary);auto data=std::string(160000,0);file<<"RIFF"<<u32(160036)<<"WAVEfmt "<<u32(16)<<u16(1)<<u16(1)<<u32(8000)<<u32(16000)<<u16(2)<<u16(16)<<"data"<<u32(160000);file.write(data.data(),data.size());}
+    App app;app.window=host;app.video=CreateWindowExW(0,L"STATIC",L"",WS_CHILD,0,0,160,90,host,nullptr,GetModuleHandleW(nullptr),nullptr);app.store=Store(executable_dir()+L"\\video-recovery-test-data");app.settings=Settings{};app.settings.speed=1.0;
+    app.guide=std::make_shared<Guide>();app.guide->bvid="BV1BMgj6MEz4";app.guide->parts.push_back({1,111,"truncated fixture",10});app.requested={app.guide->bvid,1,false,""};app.desiredPaused=false;
+    app.player.initialize(app.video,executable_dir()+L"\\..\\third_party\\mpv\\libmpv-2.dll",[]{},SourceOptions{},[&](const char* event,const json& fields){app.diagnostics->record(event,fields);});app.player.volume(0);
+    Media media;media.video=utf8(bad);media.audio=utf8(audio);app.player.load(media,0,false,"truncated video with complete audio");
+    auto until=GetTickCount64()+8000;bool observed=false;
+    do{MSG msg;while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)){TranslateMessage(&msg);DispatchMessageW(&msg);}app.sync();auto current=app.player.diagnostic_snapshot();auto values=current["values"];
+        if(values["time-pos"].is_number() && values["time-pos"].get<double>()>3 && values["demuxer-cache-state"].is_object() && values["demuxer-cache-state"].value("eof",false))observed=true;
+        if(app.busy)break;Sleep(20);
+    }while(GetTickCount64()<until);
+    expect(observed,"native truncated video reaches input EOF while the complete audio keeps moving");
+    if(!app.busy)std::cerr<<"Truncated fixture diagnostic: "<<json({{"native",app.player.diagnostic_snapshot()},{"input_valid",app.state.video_input.valid},{"input_end",app.state.video_input.video_end},{"input_remaining",app.state.video_input.video_remaining},{"input_audio",app.state.video_input.audio_position},{"predicate",premature_video_eof(app.state.video_input,app.state.position,app.state.duration)},{"candidate_entry",app.videoCandidateEntry},{"candidate_since",app.videoCandidateSince}}).dump()<<"\n";
+    expect(app.busy,"a native video-only premature EOF automatically requests a fresh source");
+    expect(app.videoRecoveryAttempts==1,"native premature EOF consumes exactly one automatic recovery attempt");
+    for(auto& job:app.jobs)if(job->thread.joinable())job->thread.join();
+    expect(app.results.size()==1,"automatic recovery resolves the same cached guide");
+    double resume=app.results.front()->resume.seconds;expect(resume>0 && resume<2,"recovery resumes at the last video boundary rather than advanced audio");
+    app.pause();app.set_speed(1.75);expect(app.desiredPaused,"a pause request made during recovery is preserved");
+    app.results.front()->public_streams=true;app.results.front()->media.video=utf8(good);app.results.front()->media.audio=utf8(audio);app.accept_results();
+    until=GetTickCount64()+8000;do{MSG msg;while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)){TranslateMessage(&msg);DispatchMessageW(&msg);}app.sync();if(app.state.loaded && app.state.position_valid)break;Sleep(20);}while(GetTickCount64()<until);
+    expect(app.state.loaded && app.state.paused && app.state.speed==1.75 && std::abs(app.state.position-resume)<0.3 && app.guide->parts[app.index].cid==111,"new source retains CID visual progress pause intent and latest speed");
+    app.pause();until=GetTickCount64()+8000;do{MSG msg;while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)){TranslateMessage(&msg);DispatchMessageW(&msg);}app.sync();if(app.state.position>5)break;Sleep(20);}while(GetTickCount64()<until);
+    expect(app.state.loaded && app.state.position>5 && app.state.video_input.valid && app.state.video_input.video_end-app.state.video_input.video_remaining>4.5 && !app.busy && app.videoRecoveryAttempts==1,"replacement video packets pass the broken boundary without mistaking normal cached EOF for failure");
+    std::cout<<"PASS native truncated video recovery and complete replacement\n";
+}
+static void background_playback_overlap(HWND host){
+    auto good=executable_dir()+L"\\video-complete.avi",bad=executable_dir()+L"\\video-background-truncated.avi",audio=executable_dir()+L"\\video-recovery-audio.wav";
+    {std::ifstream file(good,std::ios::binary);std::string bytes((std::istreambuf_iterator<char>(file)),std::istreambuf_iterator<char>());auto movi=bytes.find("movi");expect(movi!=std::string::npos,"background fixture AVI has a media list");std::ofstream cut(bad,std::ios::binary);cut.write(bytes.data(),movi+4+80*(8+768));}
+    auto release=std::make_shared<std::atomic<bool>>(false);unsigned initializations=0;
+    App app;app.window=host;app.video=CreateWindowExW(0,L"STATIC",L"",WS_CHILD,0,0,160,90,host,nullptr,GetModuleHandleW(nullptr),nullptr);app.store=Store(executable_dir()+L"\\background-overlap-test-data");app.settings=Settings{};app.desiredPaused=false;
+    app.guide=std::make_shared<Guide>();app.guide->bvid="BV1BMgj6MEz4";app.guide->parts.push_back({1,111,"buffered truncation",20});app.requested={app.guide->bvid,1,false,""};
+    app.extractBackground=[&,release](const VideoRef&,const Part&,const ExtractionOptions&,Cancellation& cancel){while(!*release){cancel.check();Sleep(5);}Media result;result.video=utf8(good);result.audio=utf8(audio);result.height=16;result.source="background_ytdl";return result;};
+    app.player.initialize(app.video,executable_dir()+L"\\..\\third_party\\mpv\\libmpv-2.dll",[]{},SourceOptions{},[&](const char* event,const json& fields){if(std::string(event)=="mpv-initialized")++initializations;app.diagnostics->record(event,fields);});app.player.volume(0);
+    Media original;original.video=utf8(bad);original.audio=utf8(audio);app.player.load(original,0,false,"buffered premature EOF");
+    auto until=GetTickCount64()+6000;do{app.sync();if(app.preparationCancel)break;Sleep(20);}while(GetTickCount64()<until);
+    expect(app.preparationCancel && !app.busy && app.state.video_input.video_remaining>2,"native buffered EOF prepares media while the current source remains loaded");
+    auto entry=app.state.entry_id;double before=app.state.position;until=GetTickCount64()+1000;do{app.sync();Sleep(20);}while(GetTickCount64()<until);
+    expect(app.state.entry_id==entry && app.state.position>before+0.65 && app.videoRecoveryAttempts==0,"native playback advances during a deliberately blocked background extraction");
+    app.pause();app.set_speed(2.0);double latest=app.state.position;*release=true;for(auto& job:app.jobs)if(job->thread.joinable())job->thread.join();app.accept_results();
+    expect(app.prepared && app.state.entry_id==entry && app.desiredPaused,"a completed preparation respects a pause issued during extraction");
+    app.pause();expect(app.videoRecoveryAttempts==1 && !app.prepared && app.applyIntentOnLoad,"resuming applies the prepared source with one bounded attempt");app.guide->parts[0].duration=10;
+    until=GetTickCount64()+5000;do{app.sync();if(app.state.loaded && app.state.position_valid && !app.applyIntentOnLoad)break;Sleep(20);}while(GetTickCount64()<until);
+    expect(app.state.loaded && !app.state.paused && app.state.speed==2.0 && std::abs(app.state.position-latest)<0.5 && app.state.entry_id!=entry && initializations==1,"handoff uses the latest playhead and speed on the same Player");
+    until=GetTickCount64()+6000;do{app.sync();if(app.state.position>8.6)break;Sleep(20);}while(GetTickCount64()<until);
+    expect(app.state.position>8.6 && app.state.video_input.valid && app.state.video_input.video_end-app.state.video_input.video_remaining>8.4 && app.videoRecoveryAttempts==1,"replacement packets cross the original eight-second boundary without another recovery");
+    std::cout<<"PASS native buffered extraction overlap and same-Player handoff\n";
+}
+static void background_preparation_failure(HWND host){
+    App app;app.window=host;app.video=CreateWindowExW(0,L"STATIC",L"",WS_CHILD,0,0,160,90,host,nullptr,GetModuleHandleW(nullptr),nullptr);app.store=Store(executable_dir()+L"\\background-failure-test-data");app.settings=Settings{};app.desiredPaused=false;
+    app.guide=std::make_shared<Guide>();app.guide->bvid="BV1BMgj6MEz4";app.guide->parts.push_back({1,111,"pending extraction failure",10});app.requested={app.guide->bvid,1,false,""};
+    app.player.initialize(app.video,executable_dir()+L"\\..\\third_party\\mpv\\libmpv-2.dll",[]{},SourceOptions{});app.player.volume(0);Media broken;broken.video=utf8(executable_dir()+L"\\video-truncated.avi");broken.audio=utf8(executable_dir()+L"\\video-recovery-audio.wav");app.player.load(broken,0,false,"hold and fallback");
+    // The process runner has its own cancellation tests. Inject a pending token
+    // here to isolate the native exhausted-cache hold/failure protocol.
+    app.preparationCancel=std::make_shared<Cancellation>();auto until=GetTickCount64()+7500;
+    do{app.sync();if(app.preparationHeld)break;Sleep(20);}while(GetTickCount64()<until);
+    expect(app.preparationHeld && app.state.paused && !app.desiredPaused && !app.busy && app.videoRecoveryAttempts==0,"drained video holds audio while an existing preparation completes");
+    auto r=std::make_unique<Result>();r->generation=app.generation;r->preparation=true;r->preparation_epoch=app.preparationEpoch;r->entry=app.state.entry_id;r->cid=111;r->quality=app.settings.quality;r->cookies=app.settings.cookies;r->ref=app.requested;r->video_end=app.state.video_input.video_end;r->prepared_at=GetTickCount64();r->error="controlled extraction failure";app.results.push_back(std::move(r));
+    app.modal=true;app.accept_results();expect(app.results.size()==1,"a modal report may defer the result notification");app.modal=false;app.timer();
+    expect(!app.preparationCancel && !app.preparationHeld && (app.busy || !app.player.snapshot().paused),"timer recovers deferred results and releases the hold or immediately starts fallback after extraction failure");
+    until=GetTickCount64()+4000;do{app.sync();if(app.busy)break;Sleep(20);}while(GetTickCount64()<until);
+    expect(app.busy && app.videoRecoveryAttempts==1,"failed background preparation falls back to one bounded original recovery");
+    app.cancel_jobs();std::cout<<"PASS native cache hold, deferred failure and bounded fallback\n";
+}
+static void background_preparation_overall_eof(HWND host){
+    auto shortAudio=executable_dir()+L"\\background-short-audio.wav";
+    {std::ifstream input(executable_dir()+L"\\video-recovery-audio.wav",std::ios::binary);std::string bytes((std::istreambuf_iterator<char>(input)),std::istreambuf_iterator<char>());std::ofstream output(shortAudio,std::ios::binary);output.write(bytes.data(),44+48000);}
+    App app;app.window=host;app.video=CreateWindowExW(0,L"STATIC",L"",WS_CHILD,0,0,160,90,host,nullptr,GetModuleHandleW(nullptr),nullptr);app.store=Store(executable_dir()+L"\\background-overall-eof-data");app.settings=Settings{};app.desiredPaused=false;
+    app.guide=std::make_shared<Guide>();app.guide->bvid="BV1BMgj6MEz4";app.guide->parts.push_back({1,111,"both inputs ended early",10});app.requested={app.guide->bvid,1,false,""};
+    app.player.initialize(app.video,executable_dir()+L"\\..\\third_party\\mpv\\libmpv-2.dll",[]{},SourceOptions{});app.player.volume(0);Media broken;broken.video=utf8(executable_dir()+L"\\video-truncated.avi");broken.audio=utf8(shortAudio);app.player.load(broken,0,false,"early overall EOF");app.preparationCancel=std::make_shared<Cancellation>();
+    double confirmedEnd=0;auto until=GetTickCount64()+6000;do{app.sync();if(app.state.video_input.valid)confirmedEnd=app.state.video_input.video_end;if(app.state.eof)break;Sleep(20);}while(GetTickCount64()<until);
+    if(!app.state.eof || app.desiredPaused || app.busy)std::cerr<<"Overall EOF diagnostic "<<json({{"eof",app.state.eof},{"paused",app.state.paused},{"intent",app.desiredPaused},{"busy",app.busy},{"loaded",app.state.loaded},{"position",app.state.position},{"input_valid",app.state.video_input.valid},{"video_end",app.state.video_input.video_end},{"remaining",app.state.video_input.video_remaining},{"audio_position",app.state.video_input.audio_position}}).dump()<<"\n";
+    expect(app.state.eof && !app.desiredPaused && !app.busy,"an early overall EOF during preparation does not become a user pause");
+    auto r=std::make_unique<Result>();r->generation=app.generation;r->preparation=true;r->preparation_epoch=app.preparationEpoch;r->entry=app.state.entry_id;r->cid=111;r->quality=app.settings.quality;r->cookies=app.settings.cookies;r->ref=app.requested;r->prepared_at=GetTickCount64();r->video_end=confirmedEnd;r->media.video=utf8(executable_dir()+L"\\video-complete.avi");r->media.audio=utf8(executable_dir()+L"\\video-recovery-audio.wav");r->media.height=16;r->media.source="background_ytdl";double expected=r->video_end-0.5;
+    app.results.push_back(std::move(r));app.lastSave=9;app.timer();
+    expect(app.videoRecoveryAttempts==1 && !app.prepared && app.applyIntentOnLoad,"a prepared replacement recovers early overall EOF automatically");
+    expect(std::abs(app.store.history(app.guide->bvid)["parts"]["111"].get<double>()-expected)<0.05,"the timer does not overwrite a clamped recovery point with the old audio position");
+    until=GetTickCount64()+5000;do{app.sync();if(app.state.loaded && app.state.position>4)break;Sleep(20);}while(GetTickCount64()<until);
+    expect(app.state.loaded && !app.state.paused && app.state.position>4,"replacement audio and video advance after early overall EOF");
+    std::cout<<"PASS early overall EOF intent and clamped progress preservation\n";
+}
+static void recovery_source_failure_regression(HWND host){
+    App app;app.window=host;app.video=CreateWindowExW(0,L"STATIC",L"",WS_CHILD,0,0,160,90,host,nullptr,GetModuleHandleW(nullptr),nullptr);app.store=Store(executable_dir()+L"\\recovery-fallback-test-data");app.settings=Settings{};app.settings.speed=1.75;app.desiredPaused=false;
+    app.guide=std::make_shared<Guide>();app.guide->bvid="BV1PyxQ6sEbH";app.guide->parts.push_back({17,43354948144,"P17 recovery replay",934.649875});app.requested={app.guide->bvid,17,false,""};app.refreshUsed=true;app.hadPlayback=true;
+    app.fetchPublic=[](const Guide& guide,const Part& part,int quality,Cancellation& cancel){cancel.check();if(guide.bvid!="BV1PyxQ6sEbH" || part.page!=17 || part.cid!=43354948144 || quality!=720)throw std::runtime_error("fallback identity changed");Media media;media.video=utf8(executable_dir()+L"\\missing-recovery-format-test.mp4");return media;};
+    app.player.initialize(app.video,executable_dir()+L"\\..\\third_party\\mpv\\libmpv-2.dll",[]{},SourceOptions{});
+    app.state.loaded=true;app.state.position_valid=true;app.state.position=811.827612;app.state.duration=934.649875;app.state.paused=false;app.state.entry_id=11;app.state.height=480;app.state.audio_codec="aac";app.state.video_input={true,true,807.366688,0,811.838117};
+    expect(!app.recover_video_input(1000) && app.recover_video_input(3000),"P17 drained input starts its first replacement after the earlier generic fallback was consumed");
+    for(auto& job:app.jobs)if(job->thread.joinable())job->thread.join();expect(app.results.size()==1,"replacement metadata resolves the preserved exact part");
+    app.pause();app.results.front()->public_streams=true;app.results.front()->media.video=utf8(executable_dir()+L"\\missing-recovery-format-test.mp4");app.accept_results();
+    auto until=GetTickCount64()+5000;do{app.sync();if(app.busy || !app.lastError.empty())break;Sleep(20);}while(GetTickCount64()<until);
+    expect(app.busy && app.lastError.empty() && app.videoRecoveryAttempts==2,"a failed recovery source still gets one bounded public fallback after generic retry was consumed");
+    for(auto& job:app.jobs)if(job->thread.joinable())job->thread.join();expect(app.results.size()==1 && app.results.front()->error.empty() && app.results.front()->public_streams && app.results.front()->guide->parts[0].cid==43354948144 && std::abs(app.results.front()->resume.seconds-806.866688)<0.001 && app.desiredPaused && app.settings.speed==1.75,"alternate source retains exact P17 video resume point CID pause intent and speed");
+    app.accept_results();until=GetTickCount64()+5000;do{app.sync();if(!app.lastError.empty())break;Sleep(20);}while(GetTickCount64()<until);
+    expect(!app.busy && !app.lastError.empty() && app.videoRecoveryAttempts==2 && !app.recoveryFallbackPending,"an alternate-source load failure terminates without a third automatic load");
+    app.open(app.requested,true);expect(app.videoRecoveryAttempts==0 && !app.recoveryFallbackPending,"manual retry resets both recovery source state and its budget");app.cancel_jobs();
+    for(int mode=0;mode<4;++mode){App timeout;timeout.window=host;timeout.video=CreateWindowExW(0,L"STATIC",L"",WS_CHILD,0,0,160,90,host,nullptr,GetModuleHandleW(nullptr),nullptr);timeout.store=Store(executable_dir()+L"\\recovery-timeout-test-data");timeout.settings=Settings{};timeout.guide=app.guide;timeout.requested=app.requested;timeout.desiredPaused=true;timeout.fetchPublic=app.fetchPublic;timeout.player.initialize(timeout.video,executable_dir()+L"\\..\\third_party\\mpv\\libmpv-2.dll",[]{},SourceOptions{});timeout.videoRecoveryAttempts=(mode==1 || mode==3)?2:1;timeout.arm_recovery_fallback(806.866688);timeout.refreshUsed=mode!=1 && mode!=3;if(mode==3)timeout.recoveryFallbackPending=false;timeout.loadStarted=GetTickCount64()-46000;if(mode==2)++timeout.recoveryFallbackGeneration;timeout.sync();
+        if(mode==0)expect(timeout.busy && timeout.videoRecoveryAttempts==2,"recovery connection timeout uses the same bounded alternate-source path");
+        else expect(!timeout.busy && !timeout.lastError.empty() && timeout.videoRecoveryAttempts==((mode==1 || mode==3)?2u:1u),"exhausted or stale recovery fallback cannot enter a generic third retry");timeout.cancel_jobs();
+    }
+    {
+        App success;success.window=host;success.video=CreateWindowExW(0,L"STATIC",L"",WS_CHILD,0,0,160,90,host,nullptr,GetModuleHandleW(nullptr),nullptr);success.guide=app.guide;success.requested=app.requested;success.desiredPaused=true;success.player.initialize(success.video,executable_dir()+L"\\..\\third_party\\mpv\\libmpv-2.dll",[]{},SourceOptions{});Media media;media.video=utf8(executable_dir()+L"\\video-complete.avi");media.audio=utf8(executable_dir()+L"\\video-recovery-audio.wav");success.player.load(media,1,true,"successful replacement");success.videoRecoveryAttempts=1;success.arm_recovery_fallback(1);until=GetTickCount64()+5000;do{success.sync();if(success.state.loaded && success.state.position_valid)break;Sleep(20);}while(GetTickCount64()<until);expect(success.state.loaded && !success.recoveryFallbackPending && success.videoRecoveryAttempts==1,"a successfully loaded recovery source disarms only its initial-load fallback");
+        expect(!success.refreshUsed,"a successful first recovery restores an unused generic retry instead of consuming it permanently");
+        media.video=utf8(executable_dir()+L"\\missing-later-source-test.mp4");media.audio.clear();success.player.load(media,1,true,"later source failure");until=GetTickCount64()+5000;do{success.sync();if(success.busy || !success.lastError.empty())break;Sleep(20);}while(GetTickCount64()<until);expect(success.busy && success.videoRecoveryAttempts==2 && success.lastError.empty(),"a later source failure consumes the remaining second recovery attempt without bypassing the cap");success.cancel_jobs();
+    }
+    std::cout<<"PASS replacement source fallback, timeout, identity, intent and strict budget\n";
+}
+static void background_recovery_guards(HWND host){
+    auto fixture=[&](App& app){app.window=host;app.store=Store(executable_dir()+L"\\background-recovery-test-data");app.settings=Settings{};app.guide=std::make_shared<Guide>();app.guide->bvid="BV1BMgj6MEz4";app.guide->parts.push_back({1,111,"buffered failure",1112.213});app.requested={app.guide->bvid,1,false,""};app.desiredPaused=false;app.state=Snapshot{};app.state.loaded=true;app.state.position_valid=true;app.state.position=672.6;app.state.duration=1112.213;app.state.paused=false;app.state.entry_id=2;app.state.height=720;app.state.audio_codec="aac";app.state.video_input={true,true,690.766687,18.166687,672.6};};
+    auto result=[&](App& app){auto r=std::make_unique<Result>();r->generation=app.generation;r->preparation=true;r->preparation_epoch=app.preparationEpoch;r->entry=app.state.entry_id;r->cid=111;r->quality=app.settings.quality;r->cookies=app.settings.cookies;r->ref=app.requested;r->media.height=720;r->media.video="https://example.invalid/video?deadline=9999999999";r->prepared_at=GetTickCount64();r->video_end=app.state.video_input.video_end;return r;};
+    {
+        App app;fixture(app);app.extractBackground=[](const VideoRef&,const Part&,const ExtractionOptions&,Cancellation& cancel)->Media{while(!cancel.cancelled)Sleep(5);throw Cancelled();};
+        expect(!app.prepare_video_input(1000) && app.prepare_video_input(2000),"stable early EOF starts preparation before playable cache drains");
+        expect(!app.busy && app.state.loaded && app.state.position==672.6 && app.videoRecoveryAttempts==0,"preparation retains active playback and reserves no reload attempt");
+        expect(!app.prepare_video_input(4000),"a damaged entry starts at most one preparation");
+        app.invalidate_preparation();expect(!app.preparationCancel && !app.prepared && !app.prepare_video_input(5000),"cancellation invalidates pending work without restarting the same entry");
+    }
+    for(int guard=0;guard<8;++guard){App app;fixture(app);if(guard==0)app.modal=true;if(guard==1)app.menuActive=true;if(guard==2)app.hidden=true;if(guard==3)app.desiredPaused=true;if(guard==4)app.state.seeking=true;if(guard==5)app.state.video_input.reader_eof=false;if(guard==6)app.state.video_input.video_end=1112.213;if(guard==7)app.videoRecoveryAttempts=2;
+        expect(!app.prepare_video_input(1000) && !app.prepare_video_input(4000),"unconfirmed input, user interaction and exhausted budget never start preparation");
+    }
+    for(int stale=0;stale<7;++stale){App app;fixture(app);auto r=result(app);if(stale==0)++r->generation;if(stale==1)++r->preparation_epoch;if(stale==2)++r->entry;if(stale==3)++r->cid;if(stale==4)r->quality=480;if(stale==5)r->cookies=L"different-cookie-file";if(stale==6)r->media.height=480;
+        app.results.push_back(std::move(r));app.accept_results();expect((!app.prepared || !app.prepared->error.empty()) && !app.busy && app.videoRecoveryAttempts==0,"obsolete identity settings or lower resolution cannot replace active playback");
+    }
+    {
+        App app;fixture(app);app.prepared=result(app);app.prepared->prepared_at=1;expect(!app.try_prepared_handoff(60002) && !app.prepared,"a prepared URL expires locally after sixty seconds");
+    }
+    {
+        App app;fixture(app);app.prepared=result(app);app.prepared->prepared_at=1;app.prepared->media=Media{};app.prepared->error="controlled failure";expect(!app.try_prepared_handoff(60002) && app.prepared && !app.busy,"failed preparation preserves URL-free boundary evidence beyond the URL freshness limit");
+    }
+    {
+        App app;fixture(app);app.prepared=result(app);app.modal=true;expect(!app.try_prepared_handoff(GetTickCount64()) && app.prepared,"a modal dialog defers replacement");app.modal=false;app.menuActive=true;expect(!app.try_prepared_handoff(GetTickCount64()) && app.prepared,"an open menu defers replacement");app.menuActive=false;app.hidden=true;expect(!app.try_prepared_handoff(GetTickCount64()) && app.prepared,"a hidden player defers replacement");app.hidden=false;app.desiredPaused=true;expect(!app.try_prepared_handoff(GetTickCount64()) && app.prepared,"pause intent defers replacement without resuming playback");
+        auto previous=GetWindowLongPtrW(host,GWLP_USERDATA);SetWindowLongPtrW(host,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&app));app.desiredPaused=false;window_proc(host,WM_HOTKEY,503,0);expect(!app.prepared,"manual seeking invalidates a prepared URL before playback restarts");SetWindowLongPtrW(host,GWLP_USERDATA,previous);
+    }
+    std::cout<<"PASS buffered source preparation and stale-result guards\n";
+}
+static void premature_video_controller_guards(HWND host){
+    auto fixture=[&](App& app){app.window=host;app.store=Store(executable_dir()+L"\\video-recovery-guard-data");app.guide=std::make_shared<Guide>();app.guide->bvid="BV1BMgj6MEz4";app.guide->parts.push_back({1,111,"report replay",648.1333125});app.requested={app.guide->bvid,1,false,""};app.settings=Settings{};app.settings.speed=1.75;app.desiredPaused=false;app.state=Snapshot{};app.state.loaded=true;app.state.position_valid=true;app.state.position=571.254610258116;app.state.duration=648.1333125;app.state.paused=false;app.state.entry_id=2;app.state.height=720;app.state.audio_codec="aac";app.state.video_input={true,true,568.033312,0,571.261245208116};};
+    for(int mode=0;mode<11;++mode){App app;fixture(app);
+        if(mode==0)app.modal=true;if(mode==1)app.hidden=true;if(mode==2)app.desiredPaused=true;if(mode==3)app.state.paused=true;if(mode==4)app.state.seeking=true;if(mode==5)app.busy=true;if(mode==6)app.applyIntentOnLoad=true;if(mode==7)app.state.video_input.valid=false;if(mode==8)app.guide->bvid="BVprevious";if(mode==9)app.requested.page=2;if(mode==10)app.menuActive=true;
+        expect(!app.recover_video_input(1000) && !app.recover_video_input(5000) && app.videoRecoveryAttempts==0,"paused hidden modal loading seeking or unavailable observations never trigger recovery");
+    }
+    {
+        App app;fixture(app);expect(!app.recover_video_input(1000) && !app.recover_video_input(2999),"premature EOF must persist for two seconds");app.state.entry_id=3;expect(!app.recover_video_input(3000) && !app.recover_video_input(4999),"a new entry starts a fresh confirmation window");
+        app.state.video_input.video_end+=1;expect(!app.recover_video_input(5000),"a changed video boundary resets confirmation");
+        app.modal=true;expect(!app.recover_video_input(9000),"a dialog cancels an in-progress confirmation");app.modal=false;expect(!app.recover_video_input(9001),"resuming after a dialog requires a new confirmation");
+    }
+    {
+        App app;fixture(app);auto previous=GetWindowLongPtrW(host,GWLP_USERDATA);SetWindowLongPtrW(host,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&app));
+        for(int key:{503,504}){expect(!app.recover_video_input(1000),"prepare a confirmation before manual seek");window_proc(host,WM_HOTKEY,key,0);expect(app.videoCandidateEntry==-1,"manual seek dispatch cancels a pending recovery even if restart events coalesce");}
+        SetWindowLongPtrW(host,GWLP_USERDATA,previous);
+    }
+    {
+        App app;fixture(app);PlaybackDiagnostics blocked(executable_path());app.diagnostics=&blocked;
+        for(unsigned attempt=1;attempt<=2;++attempt){app.state.entry_id=attempt;if(attempt==2)app.state.duration=568.1;expect(!app.recover_video_input(attempt*5000),"first stable observation does not reload immediately");expect(app.recover_video_input(attempt*5000+2000),"qualified video premature EOF requests recovery even when container duration shrinks");expect(app.busy && app.videoRecoveryAttempts==attempt && app.settings.speed==1.75,"automatic retries keep a strict budget and preserve settings");for(auto& job:app.jobs)if(job->thread.joinable())job->thread.join();expect(app.results.size()==1 && std::abs(app.results.front()->resume.seconds-567.533312)<0.001,"report failure cannot block same-CID resume from the video boundary");app.results.clear();app.jobs.clear();app.busy=false;fixture(app);}
+        app.state.entry_id=9;expect(!app.recover_video_input(20000) && app.recover_video_input(22000),"third failure enters the bounded terminal path");expect(app.videoRecoveryAttempts==2 && app.desiredPaused && !app.lastError.empty() && !app.state.loaded,"exhausted recovery budget stops audio and explains manual retry");expect(std::abs(app.store.history(app.guide->bvid)["parts"]["111"].get<double>()-567.533312)<0.001,"exhausted recovery preserves the last useful video position");
+        app.diagnostics=&app_diagnostics();app.open(app.requested,true);expect(app.videoRecoveryAttempts==0,"manual retry starts a new recovery budget");app.cancel_jobs();
+    }
+}
 int main(){
     INITCOMMONCONTROLSEX controls={sizeof(controls),ICC_STANDARD_CLASSES|ICC_WIN95_CLASSES};InitCommonControlsEx(&controls);
     HWND host=CreateWindowExW(0,L"STATIC",L"Controller test",WS_POPUP,0,0,480,320,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
     try{
+        {
+            App diagnosticMenu;HMENU menu=diagnosticMenu.context_menu();wchar_t label[80]={};
+            GetMenuStringW(menu,113,label,80,MF_BYCOMMAND);DestroyMenu(menu);
+            expect(std::wstring(label)==L"保存故障现场","context menu offers a non-destructive diagnostic capture");
+            diagnosticMenu.guide=std::make_shared<Guide>();diagnosticMenu.guide->bvid="BVprevious";diagnosticMenu.guide->parts.push_back({1,111,"old",30});
+            diagnosticMenu.requested={"BVrequested",3,false,""};diagnosticMenu.busy=true;auto context=diagnosticMenu.diagnostic_context();
+            expect(context["bvid"]=="BVrequested" && context["page"]==3 && !context.contains("cid"),"pending new source must not inherit the old guide identity");
+        }
+        premature_video_fixture(host);
+        background_playback_overlap(host);
+        background_preparation_failure(host);
+        background_preparation_overall_eof(host);
+        recovery_source_failure_regression(host);
+        premature_video_controller_guards(host);
+        background_recovery_guards(host);
         visible_edge_docking_regressions();
         screen_bounds_regressions();
         bounded_resize_geometry_regressions();
@@ -417,12 +603,25 @@ int main(){
         }
         const auto wav=executable_dir()+L"\\controller-silence.wav";
         {std::ofstream file(wav,std::ios::binary);auto u32=[&](unsigned value){file.write(reinterpret_cast<const char*>(&value),4);};auto u16=[&](unsigned short value){file.write(reinterpret_cast<const char*>(&value),2);};file.write("RIFF",4);u32(480036);file.write("WAVEfmt ",8);u32(16);u16(1);u16(1);u32(8000);u32(16000);u16(2);u16(16);file.write("data",4);u32(480000);std::string silence(480000,0);file.write(silence.data(),silence.size());}
-        app.player.initialize(app.video,executable_dir()+L"\\..\\third_party\\mpv\\libmpv-2.dll",[]{});app.player.volume(0);
+        app.player.initialize(app.video,executable_dir()+L"\\..\\third_party\\mpv\\libmpv-2.dll",[]{},SourceOptions{},[&app](const char* event,const json& fields){app.diagnostics->record(event,fields);});app.player.volume(0);
         Media local;local.video=utf8(wav);app.player.load(local,12.5,true,"restart regression");
         auto deadline=GetTickCount64()+10000;
         do{MSG msg;while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)){TranslateMessage(&msg);DispatchMessageW(&msg);}app.player.drain();app.state=app.player.snapshot();if(app.state.loaded)break;Sleep(10);}while(GetTickCount64()<deadline);
         expect(app.state.loaded && app.state.position>12,"local paused fixture loaded");
         expect(app.state.position_valid,"loaded playhead must be explicitly valid");
+        {
+            auto before=app.player.snapshot();auto properties=app.player.diagnostic_snapshot();
+            expect(properties["values"]["time-pos"].is_number() && properties["status"]["time-pos"]==0,"diagnostics keep a valid numeric media clock");
+            expect(properties["values"]["video-params/h"].is_null() && properties["status"]["video-params/h"].get<int>()<0,"audio-only media reports video properties as unavailable rather than zero");
+            app.capture_diagnostics("test-capture");auto reportPath=app.save_fault_report(false);std::ifstream file(reportPath,std::ios::binary);json report;file>>report;
+            expect(report.is_object() && report.contains("records") && !report["records"].empty(),"manual capture writes a readable report with recent evidence");
+            const auto& captured=report["records"].back()["fields"]["snapshot"];
+            expect(captured.contains("values") && captured["values"].contains("video-params/h") && captured["values"]["video-params/h"].is_null() && captured["status"]["video-params/h"].get<int>()<0,"real exported snapshots retain unavailable-property evidence within the line limit");
+            auto after=app.player.snapshot();expect(after.paused==before.paused && after.entry_id==before.entry_id && std::abs(after.position-before.position)<0.01 && after.speed==before.speed,"manual report never resumes, seeks or replaces paused media");
+            PlaybackDiagnostics unavailable(executable_path());auto previous=app.diagnostics;app.diagnostics=&unavailable;bool failed=false;
+            try{app.save_fault_report(false);}catch(...){failed=true;}app.diagnostics=previous;
+            expect(failed && app.player.snapshot().entry_id==before.entry_id && app.player.snapshot().paused,"unwritable diagnostics report fails honestly without changing playback");
+        }
         {
             auto entry=app.state.entry_id;double position=app.state.position;
             app.desiredPaused=true;
@@ -486,6 +685,12 @@ int main(){
         deadline=GetTickCount64()+5000;
         do{app.player.drain();if(!app.player.snapshot().error.empty())break;Sleep(10);}while(GetTickCount64()<deadline);
         expect(!app.player.snapshot().error.empty(),"local failure fixture");
+        {
+            auto reportPath=app.save_fault_report(false);std::ifstream file(reportPath,std::ios::binary);json report;file>>report;bool log=false,ended=false,beforeSeek=false,afterSeek=false,beforeStop=false;
+            for(const auto& entry:report["records"]){auto event=entry.value("event",std::string());log=log || event=="mpv-log";ended=ended || event=="mpv-end-file";beforeSeek=beforeSeek || event=="before-seek";afterSeek=afterSeek || event=="after-seek";beforeStop=beforeStop || event=="before-stop";}
+            expect(log && ended,"real libmpv failures leave a warning/error summary and end-file evidence");
+            expect(beforeSeek && afterSeek && beforeStop,"seek and stop preserve before/after evidence in the report");
+        }
         app.modal=true;app.refreshUsed=false;app.sync();
         expect(!app.refreshUsed && !app.busy,"a modal dialog must not consume a refresh attempt");
         app.modal=false;app.sync();

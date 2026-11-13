@@ -1,6 +1,8 @@
 #include "dialogs.h"
 #include "source.h"
 #include "player.h"
+#include "diagnostics.h"
+#include "extraction.h"
 #include <shellapi.h>
 #include <commctrl.h>
 #include <windowsx.h>
@@ -17,13 +19,16 @@ using namespace gv;
 namespace {
 constexpr UINT JOB_DONE=WM_APP+1,MEDIA_EVENT=WM_APP+2,TRAY_EVENT=WM_APP+3,SHOW_EXISTING=WM_APP+4,FRAME_READY=WM_APP+5;
 const UINT TASKBAR_CREATED=RegisterWindowMessageW(L"TaskbarCreated");
-enum Command { OPEN=100,PARTS,SETTINGS,HIDE,PAUSE,PREVIOUS,NEXT,RETRY,FROM_START,PASS_THROUGH,QUIT,SPEED,MENU_BAR };
+enum Command { OPEN=100,PARTS,SETTINGS,HIDE,PAUSE,PREVIOUS,NEXT,RETRY,FROM_START,PASS_THROUGH,QUIT,SPEED,MENU_BAR,SAVE_DIAGNOSTICS };
 constexpr int SPEED_FIRST=200;
 enum class RetrySource { Extractor,PublicApi };
-struct Result {unsigned generation=0;VideoRef ref;std::shared_ptr<Guide> guide;Resume resume;Media media;bool public_streams=false;std::string error;};
-struct Job {std::shared_ptr<Cancellation> cancel=std::make_shared<Cancellation>();std::atomic<bool> done{false};std::thread thread;};
+struct Result {unsigned generation=0;VideoRef ref;std::shared_ptr<Guide> guide;Resume resume;Media media;bool public_streams=false;std::string error;
+    bool preparation=false;unsigned preparation_epoch=0;int64_t entry=-1;long long cid=0;int quality=0;std::wstring cookies;ULONGLONG prepared_at=0,elapsed_ms=0;double video_end=0;json extraction_failure=json::object();
+};
+struct Job {std::shared_ptr<Cancellation> cancel=std::make_shared<Cancellation>();std::atomic<bool> done{false};bool preparation=false;std::thread thread;};
 std::wstring clock_text(double seconds){int t=static_cast<int>(std::max(0.0,seconds));wchar_t s[48];swprintf_s(s,L"%02d:%02d",t/60,t%60);return s;}
 std::wstring speed_text(double speed){std::wostringstream text;text<<speed<<L"×";return text.str();}
+PlaybackDiagnostics& app_diagnostics(){static PlaybackDiagnostics recorder(executable_dir()+L"\\data\\diagnostics");return recorder;}
 class App {
 public:
     HWND window=nullptr,video=nullptr,statusLabel=nullptr;HFONT font=nullptr;Store store;Settings settings;Player player;
@@ -33,10 +38,34 @@ public:
     std::array<bool,HOTKEY_COUNT> registered{};std::string message,lastError,storageWarning,hotkeyWarning;std::wstring status;Snapshot state;double lastPosition=0;int lastSave=0;
     UINT dpi=96;int top=34,bottom=25;std::array<HWND,6> buttons{};NOTIFYICONDATAW tray={};bool trayAdded=false;ULONGLONG loadStarted=0;
     long long renewedDeadline=0;
+    PlaybackDiagnostics* diagnostics=&app_diagnostics();ULONGLONG lastDiagnostic=0;
+    unsigned videoRecoveryAttempts=0;int64_t videoCandidateEntry=-1;ULONGLONG videoCandidateSince=0;double videoCandidateEnd=0;bool menuActive=false;
+    bool recoveryFallbackPending=false,recoveryPreviousRefreshUsed=false;unsigned recoveryFallbackGeneration=0;double recoveryFallbackResume=0;
+    unsigned preparationEpoch=0;int64_t preparationAttemptedEntry=-1,earlyCandidateEntry=-1;ULONGLONG earlyCandidateSince=0;double earlyCandidateEnd=0;
+    std::shared_ptr<Cancellation> preparationCancel;std::unique_ptr<Result> prepared;bool preparationHeld=false;
+    std::function<Media(const VideoRef&,const Part&,const ExtractionOptions&,Cancellation&)> extractBackground=extract_media;
+    std::function<Media(const Guide&,const Part&,int,Cancellation&)> fetchPublic=fetch_public_media;
     std::optional<RECT> resizeScreen,dpiScreen;bool resizing=false;
     RECT frameInsets={};UINT frameDpi=96;bool frameMeasured=false;
     explicit App():store(executable_dir()+L"\\data"),settings(read_settings(store.data["settings"])) {storageWarning=store.warning;}
-    ~App(){closing=true;for(auto& j:jobs)j->cancel->cancel();for(auto& j:jobs)if(j->thread.joinable())j->thread.join();if(font)DeleteObject(font);}
+    ~App(){closing=true;for(auto& j:jobs)j->cancel->cancel();for(auto& j:jobs)if(j->thread.joinable())j->thread.join();player.shutdown();if(font)DeleteObject(font);}
+    json diagnostic_context(){
+        json context={{"generation",generation},{"bvid",requested.bvid},{"page",requested.page},{"source",store.data.value("last_source",std::string())},{"quality",settings.quality},{"speed",settings.speed},{"desired_paused",desiredPaused},{"hidden",hidden},{"busy",busy},{"build_stamp",__DATE__ " " __TIME__},{"streams",player.diagnostic_source()}};
+        if(!busy && guide && guide->bvid==requested.bvid && index<guide->parts.size() && (!requested.page || guide->parts[index].page==requested.page)){context["bvid"]=guide->bvid;context["page"]=guide->parts[index].page;context["cid"]=guide->parts[index].cid;}
+        return context;
+    }
+    void capture_diagnostics(const char* reason) noexcept {
+        try{auto context=diagnostic_context();context["reason"]=reason;context["snapshot"]=player.diagnostic_snapshot();diagnostics->record("snapshot",context);}catch(...){}
+    }
+    std::wstring save_fault_report(bool notify=true){
+        reset_video_candidate();
+        capture_diagnostics("manual-capture");std::wstring path;
+        try{
+            auto context=diagnostic_context();context["snapshot"]=player.diagnostic_snapshot();path=diagnostics->save_report(context);
+            if(notify){bool previous=modal;modal=true;MessageBoxW(window,(L"故障现场已保存到：\n\n"+path+L"\n\n现在可以继续重试或重新打开视频。").c_str(),L"故障现场已保存",MB_OK|MB_ICONINFORMATION);modal=previous;}
+        }catch(...){if(!notify)throw;bool previous=modal;modal=true;MessageBoxW(window,L"无法保存故障现场，请检查程序旁 data 目录的空间和写入权限。",L"保存失败",MB_OK|MB_ICONERROR);modal=previous;}
+        return path;
+    }
     int scale(int v) const{return MulDiv(v,dpi,96);}
     void set_font(){if(font)DeleteObject(font);font=CreateFontW(-scale(13),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei UI");for(auto b:buttons)if(b)SendMessageW(b,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);if(statusLabel)SendMessageW(statusLabel,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);}
     void init(){
@@ -153,26 +182,30 @@ public:
     void cleanup_jobs(){jobs.erase(std::remove_if(jobs.begin(),jobs.end(),[](std::unique_ptr<Job>& j){if(!j->done)return false;if(j->thread.joinable())j->thread.join();return true;}),jobs.end());}
     void open(const VideoRef& ref,bool keep_pause=false,bool refresh=false,std::optional<double> start={},RetrySource retry=RetrySource::PublicApi){
         if(modal || closing)return;
+        recoveryFallbackPending=false;
+        invalidate_preparation(true);
+        reset_video_candidate();
+        capture_diagnostics(refresh?"before-refresh":"before-open");
         if(player.initialized()){state=player.snapshot();if(state.loaded && state.position_valid)lastPosition=state.position;}
         save_safely();cancel_jobs();cleanup_jobs();
         if(start && guide && guide->bvid==ref.bvid){auto p=std::find_if(guide->parts.begin(),guide->parts.end(),[&](const Part& item){return item.page==ref.page;});if(p!=guide->parts.end()){store.remember(guide->bvid,p->cid,*start);try{store.save();}catch(const std::exception& e){storageWarning=e.what();}}}
         loadStarted=0;applyIntentOnLoad=false;
-        if(!refresh){refreshUsed=false;hadPlayback=false;renewedDeadline=0;}
+        if(!refresh){refreshUsed=false;hadPlayback=false;renewedDeadline=0;videoRecoveryAttempts=0;}
         if(!keep_pause)desiredPaused=false;
         if(hidden)desiredPaused=true;
         requested=ref;busy=true;lastError.clear();message="正在获取攻略与当前分 P…";state=Snapshot{};
         trace_event("metadata-request",ref.page);
         if(player.initialized())player.stop();ShowWindow(video,SW_HIDE);KillTimer(window,1);update_status();
         auto gen=++generation;auto history=store.data["history"];auto cached=guide && guide->bvid==ref.bvid?guide:std::shared_ptr<Guide>();
-        auto quality=settings.quality;
+        auto quality=settings.quality;auto publicFetch=fetchPublic;
         auto j=std::make_unique<Job>();Job* job=j.get();auto token=j->cancel;
         double refreshPosition=lastPosition;
-        j->thread=std::thread([this,job,token,ref,gen,history,cached,quality,refresh,refreshPosition,start,retry]{
+        j->thread=std::thread([this,job,token,ref,gen,history,cached,quality,refresh,refreshPosition,start,retry,publicFetch]{
             auto r=std::make_unique<Result>();r->generation=gen;r->ref=ref;
             try{
                 r->guide=cached?cached:std::make_shared<Guide>(fetch_guide(r->ref,*token));
                 r->resume=choose_resume(r->ref,history,r->guide->parts);if(refresh)r->resume.seconds=refreshPosition;if(start)r->resume.seconds=clamp_seek(*start,0,r->guide->parts[r->resume.index].duration);
-                if(refresh && retry==RetrySource::PublicApi){r->public_streams=true;r->media=fetch_public_media(*r->guide,r->guide->parts[r->resume.index],quality,*token);}
+                if(refresh && retry==RetrySource::PublicApi){r->public_streams=true;r->media=publicFetch(*r->guide,r->guide->parts[r->resume.index],quality,*token);}
             }catch(const Cancelled&){r->error="操作已取消";}catch(const std::exception& e){r->error=e.what();}
             {std::lock_guard<std::mutex> l(resultsMutex);results.push_back(std::move(r));}
             job->done=true;if(!closing)PostMessageW(window,JOB_DONE,0,0);
@@ -182,7 +215,18 @@ public:
     void accept_results(){
         if(modal || closing)return;
         std::deque<std::unique_ptr<Result>> ready;{std::lock_guard<std::mutex> l(resultsMutex);ready.swap(results);}
-        for(auto& r:ready){if(r->generation!=generation || closing)continue;busy=false;
+        if(!ready.empty() && player.initialized()){player.drain();state=player.snapshot();}
+        for(auto& r:ready){if(r->generation!=generation || closing)continue;
+            if(r->preparation){
+                if(!preparation_matches(*r)){diagnostics->record("source-preparation-discard",{{"reason","obsolete-result"},{"entry_id",r->entry}});continue;}
+                preparationCancel.reset();
+                diagnostics->record("source-preparation-result",{{"entry_id",r->entry},{"elapsed_ms",r->elapsed_ms},{"success",r->error.empty() && r->media.height>=state.height},{"peak_job_bytes",r->media.extraction_peak_job_bytes},{"processes",r->media.extraction_processes},{"failure",r->extraction_failure}});
+                if(r->error.empty() && r->media.height<state.height)r->error="后台结果画质降低";
+                if(!r->error.empty()){r->media=Media{};release_preparation_hold();message="后台准备未成功，将在需要时重新加载";}
+                prepared=std::move(r);
+                continue;
+            }
+            busy=false;
             if(!r->error.empty()){fail(r->error);continue;}
             guide=r->guide;index=r->resume.index;requested=r->ref;requested.bvid=guide->bvid;requested.short_url=false;requested.page=guide->parts[index].page;lastPosition=r->resume.seconds;
             store.data["last_video"]=VideoRef{guide->bvid,0,false,""}.url();message.clear();
@@ -192,9 +236,13 @@ public:
             auto dll=executable_dir()+L"\\libmpv-2.dll";if(GetFileAttributesW(dll.c_str())==INVALID_FILE_ATTRIBUTES)dll=executable_dir()+L"\\..\\third_party\\mpv\\libmpv-2.dll";
             SourceOptions source;source.max_height=settings.quality;source.cookies=settings.cookies;source.yt_dlp=executable_dir()+L"\\yt-dlp.exe";
             if(GetFileAttributesW(source.yt_dlp.c_str())==INVALID_FILE_ATTRIBUTES)source.yt_dlp=executable_dir()+L"\\..\\third_party\\yt-dlp.exe";
-            player.initialize(video,dll,[this]{if(!closing)PostMessageW(window,MEDIA_EVENT,0,0);},source);player.volume(settings.volume);player.set_speed(settings.speed);
+            player.initialize(video,dll,[this]{if(!closing)PostMessageW(window,MEDIA_EVENT,0,0);},source,[this](const char* event,const json& fields){
+                json entry=fields;entry["generation"]=generation;diagnostics->record(event,entry);
+                if(std::string(event)=="mpv-file-loaded")diagnostics->record("source-context",diagnostic_context());
+            });player.volume(settings.volume);player.set_speed(settings.speed);
             ShowWindow(video,SW_SHOWNOACTIVATE);applyIntentOnLoad=true;loadStarted=GetTickCount64();trace_event(r->public_streams?"public-stream-load":"mpv-url-load",requested.page);
             if(r->public_streams)player.load(r->media,r->resume.seconds,desiredPaused||hidden,guide->parts[index].title);else player.load_url(requested.url(),r->resume.seconds,desiredPaused||hidden,guide->parts[index].title);
+            diagnostics->record("source-context",diagnostic_context());capture_diagnostics("after-load-command");
             SetTimer(window,1,1000,nullptr);lastSave=0;
         }
         cleanup_jobs();update_status();
@@ -206,10 +254,110 @@ public:
         renewedDeadline=state.source_deadline;trace_event("source-renewal",renewedDeadline);
         open(requested,true,true,{},RetrySource::Extractor);return true;
     }
-    void sync(){if(!player.initialized())return;player.drain();state=player.snapshot();if(state.loaded && state.position_valid && !busy){loadStarted=0;hadPlayback=true;lastPosition=state.position;if(applyIntentOnLoad){trace_event("file-loaded",state.height);player.set_pause(desiredPaused||hidden);applyIntentOnLoad=false;state=player.snapshot();}if(state.eof)desiredPaused=true;if(hidden && !state.paused){desiredPaused=true;player.set_pause(true);state=player.snapshot();}}if(loadStarted && (!state.loaded || !state.position_valid) && !busy && !modal && GetTickCount64()-loadStarted>45000){trace_event("load-timeout");loadStarted=0;if(!refreshUsed){refreshUsed=true;open(requested,true,true);}else{player.stop();fail("视频解析或连接超时，请右键手动重试");}return;}if(!state.error.empty() && !busy && !modal && !requested.bvid.empty()){
-            if(!refreshUsed){refreshUsed=true;open(requested,true,true,{},hadPlayback?RetrySource::Extractor:RetrySource::PublicApi);return;}fail(state.error+"；请右键选择“重试当前分 P”");KillTimer(window,1);
-        }if(renew_source(static_cast<long long>(std::time(nullptr))))return;update_status();}
-    void timer(){sync();if(++lastSave>=10){lastSave=0;if(state.loaded && !state.paused)save_safely();}}
+    void reset_video_candidate(){videoCandidateEntry=-1;videoCandidateSince=0;videoCandidateEnd=0;}
+    void arm_recovery_fallback(double resume){recoveryPreviousRefreshUsed=refreshUsed;recoveryFallbackPending=true;recoveryFallbackGeneration=generation;recoveryFallbackResume=resume;refreshUsed=true;}
+    void recovery_loaded(){if(recoveryFallbackPending){if(recoveryFallbackGeneration==generation && videoRecoveryAttempts<2)refreshUsed=recoveryPreviousRefreshUsed;recoveryFallbackPending=false;}}
+    void begin_video_recovery(double resume){++videoRecoveryAttempts;trace_event("video-input-recovery",videoRecoveryAttempts);open(requested,true,true,resume,RetrySource::Extractor);arm_recovery_fallback(resume);}
+    bool handle_remaining_recovery(){
+        if(!videoRecoveryAttempts)return false;
+        if(videoRecoveryAttempts>=2){player.stop();fail("连接重试已达上限，请右键重试当前分 P");KillTimer(window,1);}
+        else begin_video_recovery(lastPosition);
+        return true;
+    }
+    bool fallback_recovery_source(const char* trigger){
+        if(!recoveryFallbackPending)return false;
+        recoveryFallbackPending=false;
+        // This is a source-load fallback, inside the same two-replacement cap.
+        // The generic retry may already have been used hours earlier.
+        refreshUsed=true;
+        if(recoveryFallbackGeneration!=generation || videoRecoveryAttempts>=2 || !recovery_identity_valid())return false;
+        double resume=recoveryFallbackResume;++videoRecoveryAttempts;
+        diagnostics->record("recovery-source-fallback",{{"trigger",trigger},{"generation",generation},{"attempt",videoRecoveryAttempts},{"resume",resume},{"page",requested.page},{"cid",guide->parts[index].cid},{"source","public_api"}});
+        open(requested,true,true,resume,RetrySource::PublicApi);return true;
+    }
+    void reset_early_candidate(){earlyCandidateEntry=-1;earlyCandidateSince=0;earlyCandidateEnd=0;}
+    void release_preparation_hold(){if(preparationHeld){preparationHeld=false;player.set_pause(desiredPaused||hidden);}}
+    void discard_prepared(const char* reason){diagnostics->record("source-preparation-discard",{{"reason",reason},{"entry_id",state.entry_id}});prepared.reset();release_preparation_hold();message.clear();}
+    void invalidate_preparation(bool reset_attempt=false){
+        if(preparationCancel || prepared){diagnostics->record("source-preparation-cancel",{{"entry_id",state.entry_id},{"generation",generation}});message.clear();}
+        ++preparationEpoch;if(preparationCancel)preparationCancel->cancel();preparationCancel.reset();prepared.reset();release_preparation_hold();reset_early_candidate();
+        if(reset_attempt)preparationAttemptedEntry=-1;
+    }
+    bool recovery_identity_valid()const{return !requested.bvid.empty() && guide && guide->bvid==requested.bvid && index<guide->parts.size() && (!requested.page || requested.page==guide->parts[index].page);}
+    double recovery_duration()const{double duration=std::isfinite(state.duration) && state.duration>0?state.duration:0;if(recovery_identity_valid()){double expected=guide->parts[index].duration;if(std::isfinite(expected) && expected>duration)duration=expected;}return duration;}
+    bool preparation_matches(const Result& r)const{
+        return r.generation==generation && r.preparation_epoch==preparationEpoch && r.entry==state.entry_id && recovery_identity_valid() && r.ref.bvid==requested.bvid && r.ref.page==guide->parts[index].page && r.cid==guide->parts[index].cid && r.quality==settings.quality && r.cookies==settings.cookies;
+    }
+    bool prepare_video_input(ULONGLONG now){
+        if(closing || busy || modal || menuActive || hidden || desiredPaused || applyIntentOnLoad || !lastError.empty() || !state.error.empty() || !state.loaded || !state.position_valid || state.paused || state.seeking || state.eof || state.entry_id<0 || state.height<=0 || state.audio_codec.empty() || !recovery_identity_valid() || videoRecoveryAttempts>=2){reset_early_candidate();return false;}
+        if(preparationCancel || prepared || preparationAttemptedEntry==state.entry_id)return false;
+        for(auto& job:jobs)if(job->preparation && !job->done)return false;
+        if(state.video_input.video_remaining<2 || !damaged_video_input(state.video_input,state.position,recovery_duration())){reset_early_candidate();return false;}
+        if(earlyCandidateEntry!=state.entry_id || std::abs(earlyCandidateEnd-state.video_input.video_end)>0.1 || now<earlyCandidateSince){earlyCandidateEntry=state.entry_id;earlyCandidateEnd=state.video_input.video_end;earlyCandidateSince=now;return false;}
+        if(now-earlyCandidateSince<1000)return false;
+        preparationAttemptedEntry=state.entry_id;reset_early_candidate();
+        auto j=std::make_unique<Job>();j->preparation=true;auto job=j.get();auto token=j->cancel;preparationCancel=token;
+        auto r=std::make_unique<Result>();r->generation=generation;r->preparation=true;r->preparation_epoch=preparationEpoch;r->entry=state.entry_id;r->cid=guide->parts[index].cid;r->quality=settings.quality;r->cookies=settings.cookies;r->ref=requested;r->ref.page=guide->parts[index].page;r->video_end=state.video_input.video_end;
+        auto part=guide->parts[index];ExtractionOptions options;options.max_height=settings.quality;options.cookies=settings.cookies;options.executable=executable_dir()+L"\\yt-dlp.exe";
+        if(GetFileAttributesW(options.executable.c_str())==INVALID_FILE_ATTRIBUTES)options.executable=executable_dir()+L"\\..\\third_party\\yt-dlp.exe";
+        capture_diagnostics("early-video-input-eof");diagnostics->record("source-preparation-start",{{"entry_id",state.entry_id},{"generation",generation},{"cid",part.cid},{"video_end",state.video_input.video_end},{"video_remaining",state.video_input.video_remaining},{"position",state.position}});
+        try{auto context=diagnostic_context();context["reason"]="early-video-input-eof";context["snapshot"]=player.diagnostic_snapshot();diagnostics->save_report(context);}catch(...){diagnostics->record("automatic-report-failed");}
+        auto extract=extractBackground;
+        j->thread=std::thread([this,job,token,part,options,extract,r=std::move(r)]()mutable{
+            auto started=GetTickCount64();try{r->media=extract(r->ref,part,options,*token);token->check();}catch(const Cancelled&){r->error="操作已取消";}catch(const ExtractionFailure& e){r->error=e.what();r->extraction_failure=e.details;}catch(...){r->error="后台视频解析失败";}
+            r->prepared_at=GetTickCount64();r->elapsed_ms=r->prepared_at-started;
+            {std::lock_guard<std::mutex> lock(resultsMutex);results.push_back(std::move(r));}job->done=true;if(!closing)PostMessageW(window,JOB_DONE,0,0);
+        });jobs.push_back(std::move(j));message="正在后台准备播放连接…";return true;
+    }
+    bool try_prepared_handoff(ULONGLONG now){
+        if(!prepared)return false;
+        if(!preparation_matches(*prepared) || videoRecoveryAttempts>=2 || (prepared->error.empty() && (now<prepared->prepared_at || now-prepared->prepared_at>60000))){discard_prepared("obsolete-or-aged");return false;}
+        if(closing || busy || modal || menuActive || hidden || desiredPaused || applyIntentOnLoad || (state.paused && !preparationHeld && !state.eof) || state.seeking || !state.loaded || !state.position_valid || !lastError.empty() || !state.error.empty())return false;
+        auto input=state.video_input;bool confirmedBoundary=state.eof && !input.valid;
+        // At overall EOF mpv no longer exposes audio-pts. The preparation
+        // already captured a confirmed video boundary for this exact entry.
+        if(confirmedBoundary)input={true,true,prepared->video_end,0,state.position};
+        if(!damaged_video_input(input,state.position,recovery_duration()) || std::abs(prepared->video_end-input.video_end)>0.1){discard_prepared("input-changed");return false;}
+        if(!prepared->error.empty()){
+            if(!state.eof && !premature_video_eof(input,state.position,recovery_duration()))return false;
+            double resume=clamp_seek(std::min(state.position,input.video_end)-0.5,0,recovery_duration());
+            diagnostics->record("source-preparation-fallback",{{"entry_id",state.entry_id},{"resume",resume},{"overall_eof",state.eof}});begin_video_recovery(resume);return true;
+        }
+        auto deadline=extraction_deadline({{"requested_formats",json::array({{{"url",prepared->media.video}},{{"url",prepared->media.audio}}})}});
+        if(deadline>0 && deadline<=static_cast<long long>(std::time(nullptr))+60){discard_prepared("deadline-too-near");return false;}
+        double resume=clamp_seek(std::min(state.position,input.video_end-0.5),0,recovery_duration());
+        auto replacement=std::move(prepared);preparationHeld=false;++videoRecoveryAttempts;
+        capture_diagnostics("before-prepared-handoff");diagnostics->record("source-preparation-handoff",{{"attempt",videoRecoveryAttempts},{"entry_id",state.entry_id},{"resume",resume},{"video_remaining",input.video_remaining},{"overall_eof",state.eof},{"input_from_confirmed_boundary",confirmedBoundary},{"elapsed_ms",now-replacement->prepared_at},{"video_host",diagnostic_host(replacement->media.video)},{"audio_host",diagnostic_host(replacement->media.audio)}});
+        reset_video_candidate();reset_early_candidate();++generation;++preparationEpoch;
+        store.remember(guide->bvid,guide->parts[index].cid,resume);store.data["last_source"]="background_ytdl";lastPosition=resume;
+        player.set_speed(settings.speed);applyIntentOnLoad=true;loadStarted=GetTickCount64();message="已更新播放连接";
+        player.load(replacement->media,resume,desiredPaused||hidden,guide->parts[index].title);arm_recovery_fallback(resume);state=player.snapshot();diagnostics->record("source-context",diagnostic_context());capture_diagnostics("after-prepared-handoff");return true;
+    }
+    bool recover_video_input(ULONGLONG now){
+        if(closing || busy || modal || menuActive || hidden || desiredPaused || applyIntentOnLoad || !lastError.empty() || !state.error.empty() || !state.loaded || !state.position_valid || state.paused || state.seeking || state.eof || state.entry_id<0 || state.height<=0 || state.audio_codec.empty() || requested.bvid.empty() || !guide || guide->bvid!=requested.bvid || index>=guide->parts.size() || (requested.page && requested.page!=guide->parts[index].page)){reset_video_candidate();return false;}
+        // A truncated container can revise its own duration down to the bytes
+        // received. Cross-check against the metadata for this exact BVID/P.
+        double duration=std::isfinite(state.duration) && state.duration>0?state.duration:0;
+        double expected=guide->parts[index].duration;if(std::isfinite(expected) && expected>duration)duration=expected;
+        if(!premature_video_eof(state.video_input,state.position,duration)){reset_video_candidate();return false;}
+        if(videoCandidateEntry!=state.entry_id || std::abs(videoCandidateEnd-state.video_input.video_end)>0.1 || now<videoCandidateSince){videoCandidateEntry=state.entry_id;videoCandidateEnd=state.video_input.video_end;videoCandidateSince=now;return false;}
+        if(now-videoCandidateSince<2000)return false;
+        if(preparationCancel){if(!preparationHeld && player.initialized()){preparationHeld=true;player.set_pause(true);state=player.snapshot();message="视频缓存已耗尽，正在完成连接准备…";}return false;}
+        double resume=clamp_seek(std::min(state.position,state.video_input.video_end)-0.5,0,duration);
+        capture_diagnostics("premature-video-eof");
+        diagnostics->record("video-input-recovery",{{"attempt",videoRecoveryAttempts+1},{"entry_id",state.entry_id},{"generation",generation},{"video_end",state.video_input.video_end},{"video_remaining",state.video_input.video_remaining},{"audio_position",state.video_input.audio_position},{"duration",duration},{"observed_duration",state.duration},{"expected_duration",expected},{"resume",resume}});
+        try{auto context=diagnostic_context();context["reason"]="premature-video-eof";context["snapshot"]=player.diagnostic_snapshot();diagnostics->save_report(context);}catch(...){diagnostics->record("automatic-report-failed");}
+        reset_video_candidate();
+        if(videoRecoveryAttempts>=2){
+            desiredPaused=true;lastPosition=resume;store.remember(guide->bvid,guide->parts[index].cid,resume);try{store.save();}catch(const std::exception& e){storageWarning=e.what();}
+            player.stop();state=Snapshot{};fail("视频数据反复提前结束，已暂停；请右键重试当前分 P");KillTimer(window,1);return true;
+        }
+        begin_video_recovery(resume);return true;
+    }
+    void sync(){if(!player.initialized())return;player.drain();state=player.snapshot();if(state.loaded && state.position_valid && !busy){loadStarted=0;hadPlayback=true;recovery_loaded();lastPosition=state.position;if(applyIntentOnLoad){trace_event("file-loaded",state.height);player.set_pause(desiredPaused||hidden);applyIntentOnLoad=false;state=player.snapshot();}if(state.eof && !preparationCancel && !prepared)desiredPaused=true;if(hidden && !state.paused){desiredPaused=true;player.set_pause(true);state=player.snapshot();}}if(loadStarted && (!state.loaded || !state.position_valid) && !busy && !modal && !menuActive && GetTickCount64()-loadStarted>45000){trace_event("load-timeout");loadStarted=0;if(fallback_recovery_source("load-timeout"))return;if(!refreshUsed){refreshUsed=true;if(handle_remaining_recovery())return;open(requested,true,true);}else{player.stop();fail("视频解析或连接超时，请右键手动重试");}return;}if(!state.error.empty() && !busy && !modal && !menuActive && !requested.bvid.empty()){
+            if(fallback_recovery_source("load-error"))return;if(!refreshUsed){refreshUsed=true;if(handle_remaining_recovery())return;open(requested,true,true,{},hadPlayback?RetrySource::Extractor:RetrySource::PublicApi);return;}fail(state.error+"；请右键选择“重试当前分 P”");KillTimer(window,1);
+        }auto now=GetTickCount64();if(try_prepared_handoff(now))return;prepare_video_input(now);if(recover_video_input(now))return;if(!preparationCancel && !prepared && renew_source(static_cast<long long>(std::time(nullptr))))return;update_status();}
+    void timer(){accept_results();sync();auto now=GetTickCount64();if(now-lastDiagnostic>=2000){lastDiagnostic=now;capture_diagnostics("periodic");}if(++lastSave>=10){lastSave=0;if(state.loaded && !state.paused)save_safely();}}
     void update_status(){
         std::wstring value;
         if(busy)value=L"正在加载…  再次打开可切换链接";
@@ -228,7 +376,7 @@ public:
     void set_pass(bool enabled){if(enabled && !registered[0]){MessageBoxW(window,L"鼠标穿透解除热键被其他程序占用。请先在设置里更换该热键。",L"需要可用的解除热键",MB_OK|MB_ICONINFORMATION);return;}pass=enabled;LONG_PTR style=GetWindowLongPtrW(window,GWL_EXSTYLE);if(enabled){style|=WS_EX_TRANSPARENT|WS_EX_LAYERED;SetWindowLongPtrW(window,GWL_EXSTYLE,style);SetLayeredWindowAttributes(window,0,255,LWA_ALPHA);}else{style&=~(WS_EX_TRANSPARENT|WS_EX_LAYERED);SetWindowLongPtrW(window,GWL_EXSTYLE,style);}SetWindowPos(window,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_FRAMECHANGED);PostMessageW(window,FRAME_READY,0,0);update_status();}
     void toggle_hidden(){if(!hidden){if(!registered[1] && !trayAdded){MessageBoxW(window,L"显示热键被占用，且托盘图标不可用。请先更换显示热键。",L"无法安全隐藏",MB_OK);return;}desiredPaused=true;player.set_pause(true);sync();save_safely();hidden=true;ShowWindow(window,SW_HIDE);}else{hidden=false;desiredPaused=true;player.set_pause(true);ShowWindow(window,SW_SHOWNOACTIVATE);SetWindowPos(window,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);PostMessageW(window,FRAME_READY,0,0);sync();}update_status();}
     void toggle_menu_bar(){settings.menu_bar_visible=!settings.menu_bar_visible;layout();save_safely();}
-    void pause(){if(hidden)return;desiredPaused=!desiredPaused;trace_event("pause-request",desiredPaused?1:0);if(!busy && player.initialized()){player.set_pause(desiredPaused);sync();save_safely();}update_status();}
+    void pause(){if(hidden)return;capture_diagnostics("before-pause-toggle");desiredPaused=!desiredPaused;trace_event("pause-request",desiredPaused?1:0);if(!busy && player.initialized()){player.set_pause(desiredPaused);sync();save_safely();}capture_diagnostics("after-pause-toggle");update_status();}
     void set_speed(double value){player.set_speed(value);settings.speed=value;if(player.initialized())state=player.snapshot();save_safely();}
     void step_speed(int delta){
         auto current=std::find(PLAYBACK_SPEEDS.begin(),PLAYBACK_SPEEDS.end(),settings.speed);
@@ -251,7 +399,9 @@ public:
     void show_speed_menu(){
         RECT button;if(!GetWindowRect(buttons[5],&button))return;
         HWND previous=GetForegroundWindow();HMENU menu=speed_menu();SetForegroundWindow(window);
+        reset_video_candidate();bool priorMenu=menuActive;menuActive=true;
         int id=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_LEFTALIGN,button.left,button.bottom,0,window,nullptr);
+        menuActive=priorMenu;reset_video_candidate();
         DestroyMenu(menu);PostMessageW(window,WM_NULL,0,0);
         if(previous && previous!=window && IsWindow(previous))SetForegroundWindow(previous);
         if(id)command(id);
@@ -260,19 +410,20 @@ public:
     void focus_dialog(bool begin){LONG_PTR style=GetWindowLongPtrW(window,GWL_EXSTYLE);SetWindowLongPtrW(window,GWL_EXSTYLE,begin?style&~WS_EX_NOACTIVATE:style|WS_EX_NOACTIVATE);}
     void command(int id){
         if(modal || closing)return;
+        if(id==SAVE_DIAGNOSTICS){save_fault_report();return;}
         if(id>=SPEED_FIRST && id<SPEED_FIRST+static_cast<int>(PLAYBACK_SPEEDS.size())){set_speed(PLAYBACK_SPEEDS[id-SPEED_FIRST]);return;}
         if(id==SPEED){show_speed_menu();return;}
         if(id==MENU_BAR){toggle_menu_bar();return;}
         if(id==PAUSE){pause();return;}if(id==HIDE){toggle_hidden();return;}if(id==PASS_THROUGH){set_pass(!pass);return;}if(id==PREVIOUS){next(-1);return;}if(id==NEXT){next(1);return;}if(id==QUIT){PostMessageW(window,WM_CLOSE,0,0);return;}
-        if(id==RETRY){if(!requested.bvid.empty() || requested.short_url)open(requested,true);return;}
+        if(id==RETRY){capture_diagnostics("before-manual-retry");if(!requested.bvid.empty() || requested.short_url)open(requested,true);return;}
         if(id==FROM_START){if(guide && !busy)open(requested,true,false,0.0);return;}
-        HWND previous=GetForegroundWindow();bool wasPass=pass;if(pass)set_pass(false);focus_dialog(true);modal=true;
+        HWND previous=GetForegroundWindow();bool wasPass=pass;if(pass)set_pass(false);focus_dialog(true);reset_video_candidate();modal=true;
         std::optional<std::string> url;std::optional<size_t> part;std::optional<Settings> changed;
         if(id==OPEN){std::string initial="https://www.bilibili.com/video/BV1BMgj6MEz4/";if(store.data.contains("last_video") && store.data["last_video"].is_string())initial=store.data["last_video"].get<std::string>();url=open_dialog(window,initial);}
         if(id==PARTS && guide)part=parts_dialog(window,*guide,index);
         if(id==SETTINGS){unregister_keys();changed=settings_dialog(window,settings);if(changed)settings=*changed;register_keys();}
         modal=false;focus_dialog(false);if(wasPass && registered[0])set_pass(true);if(previous && previous!=window && IsWindow(previous))SetForegroundWindow(previous);
-        if(changed){save_safely();player.shutdown();state.loaded=false;if(guide)open(requested,true);}
+        if(changed){save_safely();capture_diagnostics("before-settings-reload");player.shutdown();state.loaded=false;if(guide)open(requested,true);}
         if(url)open(parse_video_url(*url));
         if(part && guide && *part<guide->parts.size()){VideoRef ref{guide->bvid,guide->parts[*part].page,false,""};open(ref,true);}
         accept_results();sync();
@@ -283,12 +434,12 @@ public:
         add(PAUSE,desiredPaused?L"继续播放":L"暂停",guide!=nullptr || busy);AppendMenuW(menu,MF_POPUP,reinterpret_cast<UINT_PTR>(speed_menu()),L"播放速度");
         add(PREVIOUS,L"上一 P",guide && index>0 && !busy);add(NEXT,L"下一 P",guide && index+1<guide->parts.size() && !busy);add(FROM_START,L"当前 P 从头播放",guide!=nullptr && !busy);add(RETRY,L"重试当前分 P",!requested.bvid.empty() || requested.short_url);AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
         auto menuLabel=L"显示菜单栏\t"+hotkey_name(settings.hotkeys[8]);add(MENU_BAR,menuLabel.c_str(),true,settings.menu_bar_visible);
-        add(PASS_THROUGH,L"鼠标穿透（快捷键可解除）",true,pass);add(HIDE,hidden?L"显示小窗（保持暂停）":L"隐藏并暂停");add(SETTINGS,L"设置 / 快捷键…");AppendMenuW(menu,MF_SEPARATOR,0,nullptr);add(QUIT,L"退出");return menu;
+        add(PASS_THROUGH,L"鼠标穿透（快捷键可解除）",true,pass);add(HIDE,hidden?L"显示小窗（保持暂停）":L"隐藏并暂停");add(SETTINGS,L"设置 / 快捷键…");add(SAVE_DIAGNOSTICS,L"保存故障现场");AppendMenuW(menu,MF_SEPARATOR,0,nullptr);add(QUIT,L"退出");return menu;
     }
-    void menu(POINT point){HWND previous=GetForegroundWindow();HMENU menu=context_menu();SetForegroundWindow(window);int id=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,point.x,point.y,0,window,nullptr);DestroyMenu(menu);PostMessageW(window,WM_NULL,0,0);if(previous && previous!=window && IsWindow(previous))SetForegroundWindow(previous);if(id)command(id);}
+    void menu(POINT point){HWND previous=GetForegroundWindow();HMENU menu=context_menu();SetForegroundWindow(window);reset_video_candidate();bool priorMenu=menuActive;menuActive=true;int id=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,point.x,point.y,0,window,nullptr);menuActive=priorMenu;reset_video_candidate();DestroyMenu(menu);PostMessageW(window,WM_NULL,0,0);if(previous && previous!=window && IsWindow(previous))SetForegroundWindow(previous);if(id)command(id);}
     void paint(){PAINTSTRUCT p;HDC dc=BeginPaint(window,&p);RECT r;GetClientRect(window,&r);HBRUSH bg=CreateSolidBrush(RGB(21,25,31));FillRect(dc,&r,bg);DeleteObject(bg);SetBkMode(dc,TRANSPARENT);SelectObject(dc,font);SetTextColor(dc,RGB(183,194,204));if(top){RECT grip={scale(4),0,scale(18),top};DrawTextW(dc,L"⠿",-1,&grip,DT_CENTER|DT_VCENTER|DT_SINGLELINE);}RECT s=r;s.top=r.bottom-bottom;s.left=scale(10);s.right-=scale(8);DrawTextW(dc,status.c_str(),-1,&s,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS);if(!player.initialized() || busy || !lastError.empty()){RECT body={scale(24),top+scale(18),r.right-scale(24),r.bottom-bottom-scale(10)};std::wstring text=busy?L"正在打开攻略…\n\n可以继续操作游戏，加载完成后开始播放。":!lastError.empty()?wide(lastError)+L"\n\n右键 → 重试当前分 P，或打开其他链接。":std::wstring(L"攻略就在游戏旁边\n\n打开 B 站链接，选择你的路线\n暂停、倒退、继续都可以用快捷键\n\n")+(settings.menu_bar_visible?L"右键打开菜单 · 拖动上方空白处移动":L"右键显示菜单栏 · 拖动底部状态栏移动");DrawTextW(dc,text.c_str(),-1,&body,DT_CENTER|DT_WORDBREAK);}EndPaint(window,&p);}
     void draw_button(DRAWITEMSTRUCT* item){HBRUSH b=CreateSolidBrush((item->itemState&ODS_SELECTED)?RGB(49,80,80):RGB(35,43,52));FillRect(item->hDC,&item->rcItem,b);DeleteObject(b);SetBkMode(item->hDC,TRANSPARENT);SetTextColor(item->hDC,RGB(224,233,239));SelectObject(item->hDC,font);wchar_t label[64];GetWindowTextW(item->hwndItem,label,64);DrawTextW(item->hDC,label,-1,&item->rcItem,DT_CENTER|DT_VCENTER|DT_SINGLELINE);}
-    void close(){if(closing)return;trace_event("window-close");if(player.initialized())state=player.snapshot();save_safely();closing=true;cancel_jobs();unregister_keys();KillTimer(window,1);player.shutdown();if(trayAdded)Shell_NotifyIconW(NIM_DELETE,&tray);DestroyWindow(window);}
+    void close(){if(closing)return;capture_diagnostics("before-close");trace_event("window-close");if(player.initialized())state=player.snapshot();save_safely();closing=true;cancel_jobs();unregister_keys();KillTimer(window,1);player.shutdown();if(trayAdded)Shell_NotifyIconW(NIM_DELETE,&tray);DestroyWindow(window);}
 };
 LRESULT CALLBACK window_proc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){App* app=reinterpret_cast<App*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));if(msg==WM_NCCREATE){app=static_cast<App*>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams);SetWindowLongPtrW(hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(app));app->window=hwnd;}if(!app)return DefWindowProcW(hwnd,msg,w,l);try{
     if(msg==TASKBAR_CREATED){app->add_tray();return 0;}
@@ -327,8 +478,8 @@ LRESULT CALLBACK window_proc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){App* app=rein
     case WM_CONTEXTMENU:{POINT p={GET_X_LPARAM(l),GET_Y_LPARAM(l)};if(p.x==-1)GetCursorPos(&p);app->menu(p);return 0;}
     case WM_COMMAND:app->command(LOWORD(w));return 0;
     case WM_KEYDOWN:if(GetKeyState(VK_CONTROL)<0){if(w=='O'){app->command(OPEN);return 0;}if(w=='P'){app->command(PARTS);return 0;}if(w==VK_OEM_COMMA){app->command(SETTINGS);return 0;}}break;
-    case WM_HOTKEY:if(!app->modal){switch(w){case 500:app->set_pass(!app->pass);break;case 501:app->toggle_hidden();break;case 502:app->pause();break;case 503:if(!app->busy){app->player.seek(-5);app->sync();}break;case 504:if(!app->busy){app->player.seek(5);app->sync();}break;case 505:app->step_speed(-1);break;case 506:app->step_speed(1);break;case 507:app->set_speed(1.0);break;case 508:app->command(MENU_BAR);break;}}return 0;
-    case JOB_DONE:app->accept_results();return 0;
+    case WM_HOTKEY:if(!app->modal){switch(w){case 500:app->set_pass(!app->pass);break;case 501:app->toggle_hidden();break;case 502:app->pause();break;case 503:if(!app->busy){app->invalidate_preparation();app->reset_video_candidate();app->player.seek(-5);app->sync();}break;case 504:if(!app->busy){app->invalidate_preparation();app->reset_video_candidate();app->player.seek(5);app->sync();}break;case 505:app->step_speed(-1);break;case 506:app->step_speed(1);break;case 507:app->set_speed(1.0);break;case 508:app->command(MENU_BAR);break;}}return 0;
+    case JOB_DONE:app->accept_results();app->sync();return 0;
     case SHOW_EXISTING:app->show_existing();return 0;
     case FRAME_READY:app->refresh_frame_insets(!app->resizeScreen);if(!app->resizeScreen)app->keep_on_screen();return 0;
     // Keep the previous margins until refresh can reconcile the old docking against the new frame.
