@@ -51,7 +51,14 @@ HttpResponse http_get(const std::wstring& url,Cancellation& cancel,const std::ws
     if(!request) throw std::runtime_error("无法创建网络请求");
     cancel.attach(request);
     struct Guard {Cancellation& c;HINTERNET h;~Guard(){c.release(h);}} guard{cancel,request};
-    DWORD redirect=WINHTTP_OPTION_REDIRECT_POLICY_NEVER;WinHttpSetOption(request,WINHTTP_OPTION_REDIRECT_POLICY,&redirect,sizeof(redirect));
+    DWORD redirect=WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+    if(!WinHttpSetOption(request,WINHTTP_OPTION_REDIRECT_POLICY,&redirect,sizeof(redirect)))
+        throw std::runtime_error("无法禁止 B 站请求自动跳转");
+    if(!cookie.empty()) {
+        DWORD disabled=WINHTTP_DISABLE_COOKIES;
+        if(!WinHttpSetOption(request,WINHTTP_OPTION_DISABLE_FEATURE,&disabled,sizeof(disabled)))
+            throw std::runtime_error("无法设置 B 站登录验证请求");
+    }
     std::wstring headers=L"Accept: application/json, text/html\r\n";
     if(!cookie.empty()) headers+=L"Cookie: "+cookie+L"\r\n";
     check_budget();

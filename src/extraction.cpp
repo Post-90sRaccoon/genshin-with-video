@@ -1,4 +1,5 @@
 #include "extraction.h"
+#include "bili_session.h"
 #include "diagnostics.h"
 #include <algorithm>
 #include <cmath>
@@ -193,11 +194,26 @@ Media extract_media(const VideoRef& ref,const Part& part,const ExtractionOptions
     if(ref.short_url || part.page<1 || part.cid<=0)invalid_media();
     auto target=ref;target.page=part.page;auto canonical=parse_video_url(target.url());if(canonical.bvid!=ref.bvid || canonical.page!=part.page)invalid_media();
     std::vector<std::wstring> arguments={L"--ignore-config",L"--no-playlist",L"--dump-single-json",L"--skip-download",L"--no-warnings",L"--socket-timeout",L"10",L"--retries",L"0",L"--extractor-retries",L"0",L"--sub-langs",L"none",L"--encoding",L"utf-8",L"--format",wide(format)};
-    if(!options.cookies.empty()){arguments.push_back(L"--cookies");arguments.push_back(options.cookies);}
+    std::optional<BiliCookieFile> managedCookies;
+    if(options.session) {
+        managedCookies.emplace(*options.session);
+        arguments.push_back(L"--no-cache-dir");
+        arguments.push_back(L"--no-plugin-dirs");
+    }
+    const auto& cookiePath=managedCookies?managedCookies->path():options.cookies;
+    if(!cookiePath.empty()){arguments.push_back(L"--cookies");arguments.push_back(cookiePath);}
     arguments.push_back(L"--");arguments.push_back(wide(canonical.url()));
     auto extracted=run_extraction_process(options.executable,arguments,options.timeout_ms,options.output_limit,cancel);cancel.check();
     json info;try{info=json::parse(extracted.output);}catch(const json::exception&){throw std::runtime_error("后台解析结果格式无效，请手动重试");}
     Media result;try{result=parse_extracted_media(info,ref,part,options.max_height);}catch(const json::exception&){invalid_media();}
+    if(options.session) {
+        // The login jar belongs to the website. Do not forward account headers to media CDN URLs.
+        auto& headers=result.headers;
+        headers.erase(std::remove_if(headers.begin(),headers.end(),[](const auto& header) {
+            const auto name=lower(header.first);
+            return name=="cookie" || name=="authorization" || name=="proxy-authorization";
+        }),headers.end());
+    }
     result.extraction_peak_job_bytes=extracted.peak_job_bytes;result.extraction_processes=extracted.processes;cancel.check();return result;
 }
 }

@@ -11,6 +11,11 @@
     "sha256": "f5389d3698ecde4ef06f4e6b1ce0294fe9ac1396228c8990b8d3416d6d177a7d",
     "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.26/yt-dlp.exe"
   },
+  "webview2": {
+    "version": "1.0.3537.50",
+    "url": "https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/1.0.3537.50/microsoft.web.webview2.1.0.3537.50.nupkg",
+    "sha256": "5ea526bbd728adda0da4d31219267e96460494a427e4894c4e09d9f320f4b9aa"
+  },
   "archiver": {
     "version": "26.04",
     "url": "https://www.7-zip.org/a/7zr.exe",

@@ -381,6 +381,68 @@ static void premature_video_controller_guards(HWND host){
         app.diagnostics=&app_diagnostics();app.open(app.requested,true);expect(app.videoRecoveryAttempts==0,"manual retry starts a new recovery budget");app.cancel_jobs();
     }
 }
+static void bili_session_playback_regression(HWND host) {
+    App app;
+    app.window=host;
+    app.store=Store(executable_dir()+L"\\bili-playback-test-data");
+    app.guide=std::make_shared<Guide>();
+    app.guide->bvid="BV1BMgj6MEz4";
+    app.guide->parts.push_back({1,111,"other part",100});
+    app.guide->parts.push_back({2,222,"current part",100});
+    const VideoRef ref{app.guide->bvid,2,false,""};
+    app.store.remember(ref.bvid,222,42.5);
+    app.desiredPaused=true;
+    app.settings.cookies=L"legacy-profile.txt";
+    app.loginSession=std::make_shared<BiliSession>(BiliSession{L"test account",{}});
+    app.extractBackground=[](const VideoRef& video,const Part& part,const ExtractionOptions& options,Cancellation&){
+        expect(video.page==2 && part.cid==222,"signed-in extraction targets the selected part");
+        expect(options.session && options.session->nickname==L"test account" && options.cookies.empty(),
+               "managed login takes precedence over the manually imported session");
+        Media media;
+        media.video="https://cdn.test/signed-in-video";
+        return media;
+    };
+    app.open(ref,true);
+    app.jobs.back()->thread.join();
+    const auto& playback=*app.results.front();
+    expect(playback.error.empty() && playback.media.video=="https://cdn.test/signed-in-video" &&
+           playback.resume.index==1 && playback.resume.seconds==42.5 && app.desiredPaused,
+           "verified account can reopen the same part at its saved position and pause state");
+    app.results.clear();
+    app.extractBackground=[](const VideoRef&,const Part&,const ExtractionOptions&,Cancellation&)->Media {
+        throw std::runtime_error("controlled extraction failure");
+    };
+    app.open(ref,true);
+    app.jobs.back()->thread.join();
+    expect(app.results.front()->error.empty() && app.results.front()->media.video.empty() &&
+           app.results.front()->login_fallback,"an unavailable signed-in source can fall back to guest playback");
+    std::cout<<"PASS signed-in part selection, resume and guest fallback\n";
+}
+
+static void next_part_playback_regression(HWND host) {
+    for(bool hidden : {false,true}) {
+        App app;
+        app.window=host;
+        app.store=Store(executable_dir()+L"\\next-part-test-data");
+        app.guide=std::make_shared<Guide>();
+        app.guide->bvid="BV1BMgj6MEz4";
+        app.guide->parts={{1,111,"first part",100},{2,222,"next part",100}};
+        app.requested={app.guide->bvid,1,false,""};
+        app.desiredPaused=true;
+        app.hidden=hidden;
+        app.store.remember(app.guide->bvid,222,12.5);
+
+        app.command(NEXT);
+        expect(app.busy && app.requested.page==2 && !app.jobs.empty(),
+               "Next P must schedule the next part");
+        app.jobs.back()->thread.join();
+        expect(!app.results.empty() && app.results.front()->error.empty() &&
+               app.results.front()->resume.seconds==12.5,"Next P keeps its saved position");
+        expect(app.desiredPaused==hidden,"Next P must play after a pause when visible and stay quiet when hidden");
+    }
+    std::cout<<"PASS Next P autoplay, saved progress and hidden pause\n";
+}
+
 int main(){
     INITCOMMONCONTROLSEX controls={sizeof(controls),ICC_STANDARD_CLASSES|ICC_WIN95_CLASSES};InitCommonControlsEx(&controls);
     HWND host=CreateWindowExW(0,L"STATIC",L"Controller test",WS_POPUP,0,0,480,320,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
@@ -393,6 +455,8 @@ int main(){
             diagnosticMenu.requested={"BVrequested",3,false,""};diagnosticMenu.busy=true;auto context=diagnosticMenu.diagnostic_context();
             expect(context["bvid"]=="BVrequested" && context["page"]==3 && !context.contains("cid"),"pending new source must not inherit the old guide identity");
         }
+        next_part_playback_regression(host);
+        bili_session_playback_regression(host);
         premature_video_fixture(host);
         background_playback_overlap(host);
         background_preparation_failure(host);

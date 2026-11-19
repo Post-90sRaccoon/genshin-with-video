@@ -23,4 +23,23 @@ if (!(Test-Path -LiteralPath (Join-Path $vendor 'mpv/libmpv-2.dll'))) {
 if ((Get-FileHash -LiteralPath (Join-Path $vendor 'mpv/libmpv-2.dll') -Algorithm SHA256).Hash -ne $lock.mpv.dll_sha256) { throw 'libmpv DLL SHA256 mismatch' }
 $null = Get-Asset $lock.yt_dlp.url (Join-Path $vendor 'yt-dlp.exe') $lock.yt_dlp.sha256
 $null = Get-Asset $lock.json.url (Join-Path $vendor 'include/json.hpp') $lock.json.sha256
-Write-Output ('Pinned dependencies verified: mpv ' + $lock.mpv.tag + ', yt-dlp ' + $lock.yt_dlp.tag)
+$sdk = Join-Path $vendor ('downloads/microsoft.web.webview2.' + $lock.webview2.version + '.nupkg')
+$null = Get-Asset $lock.webview2.url $sdk $lock.webview2.sha256
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$webview = Join-Path $vendor 'webview2'
+New-Item -ItemType Directory -Force -Path (Join-Path $webview 'include'),(Join-Path $webview 'x64'),(Join-Path $webview 'notices') | Out-Null
+$entries = @{
+    'build/native/include/WebView2.h' = 'include/WebView2.h'
+    'build/native/x64/WebView2Loader.dll' = 'x64/WebView2Loader.dll'
+    'LICENSE.txt' = 'notices/WebView2-LICENSE.txt'
+    'NOTICE.txt' = 'notices/WebView2-NOTICE.txt'
+}
+$zip = [IO.Compression.ZipFile]::OpenRead($sdk)
+try {
+    foreach ($entry in $entries.GetEnumerator()) {
+        $file = $zip.GetEntry($entry.Key)
+        if ($null -eq $file) { throw "Missing WebView2 SDK member: $($entry.Key)" }
+        [IO.Compression.ZipFileExtensions]::ExtractToFile($file, (Join-Path $webview $entry.Value), $true)
+    }
+} finally { $zip.Dispose() }
+Write-Output ('Pinned dependencies verified: mpv ' + $lock.mpv.tag + ', yt-dlp ' + $lock.yt_dlp.tag + ', WebView2 SDK ' + $lock.webview2.version)

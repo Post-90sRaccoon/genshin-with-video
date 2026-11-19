@@ -1,8 +1,10 @@
 #pragma once
 #include "platform.h"
 #include <cstddef>
+#include <memory>
 
 namespace gv {
+struct BiliSession;
 struct ExtractionFailure : std::runtime_error {
     json details;
     explicit ExtractionFailure(json evidence):std::runtime_error(
@@ -14,6 +16,7 @@ struct ExtractionOptions {
     int max_height=720;
     unsigned timeout_ms=30000;
     size_t output_limit=4*1024*1024;
+    std::shared_ptr<const BiliSession> session;
 };
 struct ExtractionProcessResult {
     std::string output;

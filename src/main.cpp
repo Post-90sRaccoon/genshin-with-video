@@ -3,10 +3,12 @@
 #include "player.h"
 #include "diagnostics.h"
 #include "extraction.h"
+#include "login_window.h"
 #include <shellapi.h>
 #include <commctrl.h>
 #include <windowsx.h>
 #include <dwmapi.h>
+#include <objbase.h>
 #include <thread>
 #include <memory>
 #include <deque>
@@ -15,23 +17,71 @@
 #include <algorithm>
 #include <ctime>
 #include <cmath>
+#include <filesystem>
+#include <chrono>
 using namespace gv;
 namespace {
 constexpr UINT JOB_DONE=WM_APP+1,MEDIA_EVENT=WM_APP+2,TRAY_EVENT=WM_APP+3,SHOW_EXISTING=WM_APP+4,FRAME_READY=WM_APP+5;
 const UINT TASKBAR_CREATED=RegisterWindowMessageW(L"TaskbarCreated");
-enum Command { OPEN=100,PARTS,SETTINGS,HIDE,PAUSE,PREVIOUS,NEXT,RETRY,FROM_START,PASS_THROUGH,QUIT,SPEED,MENU_BAR,SAVE_DIAGNOSTICS };
+enum Command { OPEN=100,PARTS,SETTINGS,HIDE,PAUSE,PREVIOUS,NEXT,RETRY,FROM_START,PASS_THROUGH,QUIT,SPEED,MENU_BAR,SAVE_DIAGNOSTICS,BILI_LOGIN,BILI_LOGOUT,BILI_ACCOUNT_LABEL };
 constexpr int SPEED_FIRST=200;
 enum class RetrySource { Extractor,PublicApi };
-struct Result {unsigned generation=0;VideoRef ref;std::shared_ptr<Guide> guide;Resume resume;Media media;bool public_streams=false;std::string error;
+struct Result {unsigned generation=0;VideoRef ref;std::shared_ptr<Guide> guide;Resume resume;Media media;bool public_streams=false,login_fallback=false;std::string error;
     bool preparation=false;unsigned preparation_epoch=0;int64_t entry=-1;long long cid=0;int quality=0;std::wstring cookies;ULONGLONG prepared_at=0,elapsed_ms=0;double video_end=0;json extraction_failure=json::object();
 };
 struct Job {std::shared_ptr<Cancellation> cancel=std::make_shared<Cancellation>();std::atomic<bool> done{false};bool preparation=false;std::thread thread;};
+std::wstring account_directory(){return executable_dir()+L"\\data";}
+std::wstring extractor_path() {
+    const auto bin=executable_dir()+L"\\yt-dlp.exe";
+    return GetFileAttributesW(bin.c_str())!=INVALID_FILE_ATTRIBUTES?bin:executable_dir()+L"\\..\\third_party\\yt-dlp.exe";
+}
+struct LoginProfile {
+    std::wstring path;
+    HANDLE browser=nullptr;
+    LoginProfile() {
+        wchar_t temp[32768]={};
+        const DWORD chars=GetTempPathW(static_cast<DWORD>(std::size(temp)),temp);
+        GUID id{};
+        wchar_t suffix[40]={};
+        if(!chars || chars>=std::size(temp) || FAILED(CoCreateGuid(&id)) ||
+           !StringFromGUID2(id,suffix,static_cast<int>(std::size(suffix))))
+            throw std::runtime_error("无法创建 B 站登录窗口的临时目录");
+        path=std::wstring(temp)+L"GenshinVideo-login-"+suffix;
+        if(!CreateDirectoryW(path.c_str(),nullptr))throw std::runtime_error("无法创建 B 站登录窗口的临时目录");
+    }
+    ~LoginProfile() {
+        if(!browser) {
+            std::error_code error;
+            std::filesystem::remove_all(path,error);
+            return;
+        }
+        try {
+            // The runtime releases its profile after the dialog closes. Keep that wait off the UI thread.
+            std::thread([owned=std::move(path),process=browser]{
+                const DWORD exited=WaitForSingleObject(process,10000);
+                CloseHandle(process);
+                if(exited!=WAIT_OBJECT_0)return;
+                for(int attempt=0;attempt<4;++attempt) {
+                    std::error_code error;
+                    std::filesystem::remove_all(owned,error);
+                    if(!error)return;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                }
+            }).detach();
+        } catch(...) {
+            CloseHandle(browser);
+        }
+    }
+    LoginProfile(const LoginProfile&)=delete;
+    LoginProfile& operator=(const LoginProfile&)=delete;
+};
 std::wstring clock_text(double seconds){int t=static_cast<int>(std::max(0.0,seconds));wchar_t s[48];swprintf_s(s,L"%02d:%02d",t/60,t%60);return s;}
 std::wstring speed_text(double speed){std::wostringstream text;text<<speed<<L"×";return text.str();}
 PlaybackDiagnostics& app_diagnostics(){static PlaybackDiagnostics recorder(executable_dir()+L"\\data\\diagnostics");return recorder;}
 class App {
 public:
     HWND window=nullptr,video=nullptr,statusLabel=nullptr;HFONT font=nullptr;Store store;Settings settings;Player player;
+    std::shared_ptr<const BiliSession> loginSession;
     std::shared_ptr<Guide> guide;size_t index=0;VideoRef requested;
     std::vector<std::unique_ptr<Job>> jobs;std::mutex resultsMutex;std::deque<std::unique_ptr<Result>> results;
     std::atomic<bool> closing{false};unsigned generation=0;bool busy=false,desiredPaused=false,hidden=false,pass=false,modal=false,refreshUsed=false,applyIntentOnLoad=false,hadPlayback=false;
@@ -47,7 +97,7 @@ public:
     std::function<Media(const Guide&,const Part&,int,Cancellation&)> fetchPublic=fetch_public_media;
     std::optional<RECT> resizeScreen,dpiScreen;bool resizing=false;
     RECT frameInsets={};UINT frameDpi=96;bool frameMeasured=false;
-    explicit App():store(executable_dir()+L"\\data"),settings(read_settings(store.data["settings"])) {storageWarning=store.warning;}
+    explicit App():store(account_directory()),settings(read_settings(store.data["settings"])) {storageWarning=store.warning;}
     ~App(){closing=true;for(auto& j:jobs)j->cancel->cancel();for(auto& j:jobs)if(j->thread.joinable())j->thread.join();player.shutdown();if(font)DeleteObject(font);}
     json diagnostic_context(){
         json context={{"generation",generation},{"bvid",requested.bvid},{"page",requested.page},{"source",store.data.value("last_source",std::string())},{"quality",settings.quality},{"speed",settings.speed},{"desired_paused",desiredPaused},{"hidden",hidden},{"busy",busy},{"build_stamp",__DATE__ " " __TIME__},{"streams",player.diagnostic_source()}};
@@ -198,14 +248,31 @@ public:
         if(player.initialized())player.stop();ShowWindow(video,SW_HIDE);KillTimer(window,1);update_status();
         auto gen=++generation;auto history=store.data["history"];auto cached=guide && guide->bvid==ref.bvid?guide:std::shared_ptr<Guide>();
         auto quality=settings.quality;auto publicFetch=fetchPublic;
+        const auto account=loginSession;
+        auto authenticatedExtract=extractBackground;
         auto j=std::make_unique<Job>();Job* job=j.get();auto token=j->cancel;
         double refreshPosition=lastPosition;
-        j->thread=std::thread([this,job,token,ref,gen,history,cached,quality,refresh,refreshPosition,start,retry,publicFetch]{
+        j->thread=std::thread([this,job,token,ref,gen,history,cached,quality,refresh,refreshPosition,start,retry,publicFetch,account,authenticatedExtract]{
             auto r=std::make_unique<Result>();r->generation=gen;r->ref=ref;
             try{
                 r->guide=cached?cached:std::make_shared<Guide>(fetch_guide(r->ref,*token));
                 r->resume=choose_resume(r->ref,history,r->guide->parts);if(refresh)r->resume.seconds=refreshPosition;if(start)r->resume.seconds=clamp_seek(*start,0,r->guide->parts[r->resume.index].duration);
                 if(refresh && retry==RetrySource::PublicApi){r->public_streams=true;r->media=publicFetch(*r->guide,r->guide->parts[r->resume.index],quality,*token);}
+                else if(account) {
+                    ExtractionOptions options;
+                    options.executable=extractor_path();
+                    options.max_height=quality;
+                    options.session=account;
+                    try {
+                        r->media=authenticatedExtract(r->ref,r->guide->parts[r->resume.index],options,*token);
+                        r->media.source="account_ytdl";
+                    } catch(const Cancelled&) {
+                        throw;
+                    } catch(const std::exception&) {
+                        token->check();
+                        r->login_fallback=true;
+                    }
+                }
             }catch(const Cancelled&){r->error="操作已取消";}catch(const std::exception& e){r->error=e.what();}
             {std::lock_guard<std::mutex> l(resultsMutex);results.push_back(std::move(r));}
             job->done=true;if(!closing)PostMessageW(window,JOB_DONE,0,0);
@@ -230,18 +297,20 @@ public:
             if(!r->error.empty()){fail(r->error);continue;}
             guide=r->guide;index=r->resume.index;requested=r->ref;requested.bvid=guide->bvid;requested.short_url=false;requested.page=guide->parts[index].page;lastPosition=r->resume.seconds;
             store.data["last_video"]=VideoRef{guide->bvid,0,false,""}.url();message.clear();
-            store.data.erase("last_extraction");store.data["last_source"]=r->public_streams?"public_api":"mpv_ytdl";
+            const bool direct=!r->media.video.empty();
+            store.data.erase("last_extraction");store.data["last_source"]=direct?r->media.source:"mpv_ytdl";
             try{store.save();}catch(const std::exception& e){storageWarning=e.what();}
             if(r->public_streams && r->media.height<settings.quality)message="当前可用画质 "+std::to_string(r->media.height)+"p";
+            if(r->login_fallback)message="登录取流失败，正在使用游客播放";
             auto dll=executable_dir()+L"\\libmpv-2.dll";if(GetFileAttributesW(dll.c_str())==INVALID_FILE_ATTRIBUTES)dll=executable_dir()+L"\\..\\third_party\\mpv\\libmpv-2.dll";
-            SourceOptions source;source.max_height=settings.quality;source.cookies=settings.cookies;source.yt_dlp=executable_dir()+L"\\yt-dlp.exe";
-            if(GetFileAttributesW(source.yt_dlp.c_str())==INVALID_FILE_ATTRIBUTES)source.yt_dlp=executable_dir()+L"\\..\\third_party\\yt-dlp.exe";
+            SourceOptions source;source.max_height=settings.quality;source.yt_dlp=extractor_path();
+            if(!loginSession)source.cookies=settings.cookies;
             player.initialize(video,dll,[this]{if(!closing)PostMessageW(window,MEDIA_EVENT,0,0);},source,[this](const char* event,const json& fields){
                 json entry=fields;entry["generation"]=generation;diagnostics->record(event,entry);
                 if(std::string(event)=="mpv-file-loaded")diagnostics->record("source-context",diagnostic_context());
             });player.volume(settings.volume);player.set_speed(settings.speed);
-            ShowWindow(video,SW_SHOWNOACTIVATE);applyIntentOnLoad=true;loadStarted=GetTickCount64();trace_event(r->public_streams?"public-stream-load":"mpv-url-load",requested.page);
-            if(r->public_streams)player.load(r->media,r->resume.seconds,desiredPaused||hidden,guide->parts[index].title);else player.load_url(requested.url(),r->resume.seconds,desiredPaused||hidden,guide->parts[index].title);
+            ShowWindow(video,SW_SHOWNOACTIVATE);applyIntentOnLoad=true;loadStarted=GetTickCount64();trace_event(r->public_streams?"public-stream-load":direct?"account-stream-load":"mpv-url-load",requested.page);
+            if(direct)player.load(r->media,r->resume.seconds,desiredPaused||hidden,guide->parts[index].title);else player.load_url(requested.url(),r->resume.seconds,desiredPaused||hidden,guide->parts[index].title);
             diagnostics->record("source-context",diagnostic_context());capture_diagnostics("after-load-command");
             SetTimer(window,1,1000,nullptr);lastSave=0;
         }
@@ -298,8 +367,9 @@ public:
         preparationAttemptedEntry=state.entry_id;reset_early_candidate();
         auto j=std::make_unique<Job>();j->preparation=true;auto job=j.get();auto token=j->cancel;preparationCancel=token;
         auto r=std::make_unique<Result>();r->generation=generation;r->preparation=true;r->preparation_epoch=preparationEpoch;r->entry=state.entry_id;r->cid=guide->parts[index].cid;r->quality=settings.quality;r->cookies=settings.cookies;r->ref=requested;r->ref.page=guide->parts[index].page;r->video_end=state.video_input.video_end;
-        auto part=guide->parts[index];ExtractionOptions options;options.max_height=settings.quality;options.cookies=settings.cookies;options.executable=executable_dir()+L"\\yt-dlp.exe";
-        if(GetFileAttributesW(options.executable.c_str())==INVALID_FILE_ATTRIBUTES)options.executable=executable_dir()+L"\\..\\third_party\\yt-dlp.exe";
+        auto part=guide->parts[index];ExtractionOptions options;options.max_height=settings.quality;
+        options.session=loginSession;options.executable=extractor_path();
+        if(!options.session)options.cookies=settings.cookies;
         capture_diagnostics("early-video-input-eof");diagnostics->record("source-preparation-start",{{"entry_id",state.entry_id},{"generation",generation},{"cid",part.cid},{"video_end",state.video_input.video_end},{"video_remaining",state.video_input.video_remaining},{"position",state.position}});
         try{auto context=diagnostic_context();context["reason"]="early-video-input-eof";context["snapshot"]=player.diagnostic_snapshot();diagnostics->save_report(context);}catch(...){diagnostics->record("automatic-report-failed");}
         auto extract=extractBackground;
@@ -406,7 +476,16 @@ public:
         if(previous && previous!=window && IsWindow(previous))SetForegroundWindow(previous);
         if(id)command(id);
     }
-    void next(int delta){if(!guide || busy)return;auto target=static_cast<long long>(index)+delta;if(target<0 || target>=static_cast<long long>(guide->parts.size()))return;VideoRef ref{guide->bvid,guide->parts[static_cast<size_t>(target)].page,false,""};open(ref,true);}
+    void open_part(size_t target) {
+        if(!guide || target>=guide->parts.size())return;
+        VideoRef ref{guide->bvid,guide->parts[target].page,false,""};
+        open(ref,target!=index+1);
+    }
+    void next(int delta) {
+        if(!guide || busy)return;
+        const auto target=static_cast<long long>(index)+delta;
+        if(target>=0)open_part(static_cast<size_t>(target));
+    }
     void focus_dialog(bool begin){LONG_PTR style=GetWindowLongPtrW(window,GWL_EXSTYLE);SetWindowLongPtrW(window,GWL_EXSTYLE,begin?style&~WS_EX_NOACTIVATE:style|WS_EX_NOACTIVATE);}
     void command(int id){
         if(modal || closing)return;
@@ -419,13 +498,52 @@ public:
         if(id==FROM_START){if(guide && !busy)open(requested,true,false,0.0);return;}
         HWND previous=GetForegroundWindow();bool wasPass=pass;if(pass)set_pass(false);focus_dialog(true);reset_video_candidate();modal=true;
         std::optional<std::string> url;std::optional<size_t> part;std::optional<Settings> changed;
+        bool accountChanged=false;
         if(id==OPEN){std::string initial="https://www.bilibili.com/video/BV1BMgj6MEz4/";if(store.data.contains("last_video") && store.data["last_video"].is_string())initial=store.data["last_video"].get<std::string>();url=open_dialog(window,initial);}
         if(id==PARTS && guide)part=parts_dialog(window,*guide,index);
         if(id==SETTINGS){unregister_keys();changed=settings_dialog(window,settings);if(changed)settings=*changed;register_keys();}
+        if(id==BILI_LOGIN || id==BILI_LOGOUT) {
+            try {
+                if(id==BILI_LOGIN) {
+                    LoginProfile profile;
+                    auto result=bili_login_dialog(window,profile.path,&profile.browser);
+                    if(result) {
+                        auto account=std::make_shared<BiliSession>(std::move(*result));
+                        save_bili_session(account_directory(),*account);
+                        loginSession=std::move(account);
+                        accountChanged=true;
+                    }
+                } else if((loginSession || !settings.cookies.empty()) &&
+                          MessageBoxW(window,L"退出小窗中的 B 站账号并切换到游客播放？",L"B 站账号",MB_YESNO|MB_DEFBUTTON2|MB_ICONQUESTION)==IDYES) {
+                    auto previousFile=settings.cookies;
+                    settings.cookies.clear();
+                    try {
+                        if(!previousFile.empty())save();
+                        remove_bili_session(account_directory());
+                    } catch(...) {
+                        settings.cookies=std::move(previousFile);
+                        store.data["settings"]=write_settings(settings);
+                        throw;
+                    }
+                    loginSession.reset();
+                    accountChanged=true;
+                }
+            } catch(const std::exception&) {
+                MessageBoxW(window,L"无法更新小窗的 B 站登录信息，请检查程序目录是否可写后重试。",L"B 站账号",MB_OK|MB_ICONWARNING);
+            }
+        }
         modal=false;focus_dialog(false);if(wasPass && registered[0])set_pass(true);if(previous && previous!=window && IsWindow(previous))SetForegroundWindow(previous);
-        if(changed){save_safely();capture_diagnostics("before-settings-reload");player.shutdown();state.loaded=false;if(guide)open(requested,true);}
+        if(changed || accountChanged) {
+            if(accountChanged && player.initialized())state=player.snapshot();
+            save_safely();
+            capture_diagnostics("before-settings-reload");
+            player.shutdown();
+            state.loaded=false;
+            if(guide || (accountChanged && (!requested.bvid.empty() || requested.short_url)))open(requested,true);
+            else if(accountChanged)message=loginSession?"B 站已登录 · "+utf8(loginSession->nickname):"正在使用游客模式";
+        }
         if(url)open(parse_video_url(*url));
-        if(part && guide && *part<guide->parts.size()){VideoRef ref{guide->bvid,guide->parts[*part].page,false,""};open(ref,true);}
+        if(part)open_part(*part);
         accept_results();sync();
     }
     HMENU context_menu(){
@@ -434,7 +552,19 @@ public:
         add(PAUSE,desiredPaused?L"继续播放":L"暂停",guide!=nullptr || busy);AppendMenuW(menu,MF_POPUP,reinterpret_cast<UINT_PTR>(speed_menu()),L"播放速度");
         add(PREVIOUS,L"上一 P",guide && index>0 && !busy);add(NEXT,L"下一 P",guide && index+1<guide->parts.size() && !busy);add(FROM_START,L"当前 P 从头播放",guide!=nullptr && !busy);add(RETRY,L"重试当前分 P",!requested.bvid.empty() || requested.short_url);AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
         auto menuLabel=L"显示菜单栏\t"+hotkey_name(settings.hotkeys[8]);add(MENU_BAR,menuLabel.c_str(),true,settings.menu_bar_visible);
-        add(PASS_THROUGH,L"鼠标穿透（快捷键可解除）",true,pass);add(HIDE,hidden?L"显示小窗（保持暂停）":L"隐藏并暂停");add(SETTINGS,L"设置 / 快捷键…");add(SAVE_DIAGNOSTICS,L"保存故障现场");AppendMenuW(menu,MF_SEPARATOR,0,nullptr);add(QUIT,L"退出");return menu;
+        add(PASS_THROUGH,L"鼠标穿透（快捷键可解除）",true,pass);add(HIDE,hidden?L"显示小窗（保持暂停）":L"隐藏并暂停");
+        AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
+        if(loginSession) {
+            std::wstring label=L"B 站账号：";
+            for(wchar_t ch:loginSession->nickname) {
+                if(ch==L'&')label+=L'&';
+                label+=ch;
+            }
+            add(BILI_ACCOUNT_LABEL,label.c_str(),false);
+        }
+        add(BILI_LOGIN,loginSession?L"切换 B 站账号…":L"B 站扫码登录…");
+        if(loginSession || !settings.cookies.empty())add(BILI_LOGOUT,L"退出 B 站登录…");
+        add(SETTINGS,L"设置 / 快捷键…");add(SAVE_DIAGNOSTICS,L"保存故障现场");AppendMenuW(menu,MF_SEPARATOR,0,nullptr);add(QUIT,L"退出");return menu;
     }
     void menu(POINT point){HWND previous=GetForegroundWindow();HMENU menu=context_menu();SetForegroundWindow(window);reset_video_candidate();bool priorMenu=menuActive;menuActive=true;int id=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,point.x,point.y,0,window,nullptr);menuActive=priorMenu;reset_video_candidate();DestroyMenu(menu);PostMessageW(window,WM_NULL,0,0);if(previous && previous!=window && IsWindow(previous))SetForegroundWindow(previous);if(id)command(id);}
     void paint(){PAINTSTRUCT p;HDC dc=BeginPaint(window,&p);RECT r;GetClientRect(window,&r);HBRUSH bg=CreateSolidBrush(RGB(21,25,31));FillRect(dc,&r,bg);DeleteObject(bg);SetBkMode(dc,TRANSPARENT);SelectObject(dc,font);SetTextColor(dc,RGB(183,194,204));if(top){RECT grip={scale(4),0,scale(18),top};DrawTextW(dc,L"⠿",-1,&grip,DT_CENTER|DT_VCENTER|DT_SINGLELINE);}RECT s=r;s.top=r.bottom-bottom;s.left=scale(10);s.right-=scale(8);DrawTextW(dc,status.c_str(),-1,&s,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS);if(!player.initialized() || busy || !lastError.empty()){RECT body={scale(24),top+scale(18),r.right-scale(24),r.bottom-bottom-scale(10)};std::wstring text=busy?L"正在打开攻略…\n\n可以继续操作游戏，加载完成后开始播放。":!lastError.empty()?wide(lastError)+L"\n\n右键 → 重试当前分 P，或打开其他链接。":std::wstring(L"攻略就在游戏旁边\n\n打开 B 站链接，选择你的路线\n暂停、倒退、继续都可以用快捷键\n\n")+(settings.menu_bar_visible?L"右键打开菜单 · 拖动上方空白处移动":L"右键显示菜单栏 · 拖动底部状态栏移动");DrawTextW(dc,text.c_str(),-1,&body,DT_CENTER|DT_WORDBREAK);}EndPaint(window,&p);}
@@ -499,7 +629,13 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
         auto identity=std::to_wstring(std::hash<std::wstring>{}(executable_dir()));std::wstring className=L"GenshinVideoOverlay-"+identity;
         std::wstring name=L"Local\\GenshinVideo-"+identity;HANDLE mutex=CreateMutexW(nullptr,FALSE,name.c_str());
         if(GetLastError()==ERROR_ALREADY_EXISTS){HWND existing=FindWindowW(className.c_str(),nullptr);if(existing)PostMessageW(existing,SHOW_EXISTING,0,0);else MessageBoxW(nullptr,L"小窗正在启动，请稍后再次打开。",L"原神攻略小窗",MB_OK);if(mutex)CloseHandle(mutex);return 0;}
-        App app;WNDCLASSEXW wc={sizeof(wc)};wc.lpfnWndProc=window_proc;wc.hInstance=instance;wc.lpszClassName=className.c_str();wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.hIcon=LoadIconW(nullptr,IDI_APPLICATION);RegisterClassExW(&wc);
+        App app;
+        try {
+            if(auto saved=load_bili_session(account_directory()))app.loginSession=std::make_shared<BiliSession>(std::move(*saved));
+        } catch(const std::exception&) {
+            app.message="无法读取 B 站登录信息，可右键重新扫码";
+        }
+        WNDCLASSEXW wc={sizeof(wc)};wc.lpfnWndProc=window_proc;wc.hInstance=instance;wc.lpszClassName=className.c_str();wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.hIcon=LoadIconW(nullptr,IDI_APPLICATION);RegisterClassExW(&wc);
         RECT work={0,0,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN)};SystemParametersInfoW(SPI_GETWORKAREA,0,&work,0);UINT systemDpi=GetDpiForSystem();int minWidth=MulDiv(330,systemDpi,96),minHeight=MulDiv(230,systemDpi,96);int x=work.left+16,y=work.bottom-MulDiv(360,systemDpi,96),w=MulDiv(496,systemDpi,96),h=MulDiv(346,systemDpi,96);
         try {auto r=app.store.data.value("window",json::object());x=std::clamp(r.value("x",x),-100000,100000);y=std::clamp(r.value("y",y),-100000,100000);w=std::clamp(r.value("width",w),minWidth,3840);h=std::clamp(r.value("height",h),minHeight,2160);}catch(...){}
         RECT saved={x,y,x+w,y+h};HMONITOR mon=MonitorFromRect(&saved,MONITOR_DEFAULTTONULL);if(!mon){x=work.left+16;y=std::max(work.top,work.bottom-h-16);}

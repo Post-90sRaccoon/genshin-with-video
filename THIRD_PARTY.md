@@ -1,5 +1,7 @@
 # 第三方组件
 
+- **Microsoft WebView2 SDK**：固定版本 `1.0.3537.50`，来自 [Microsoft 的 NuGet 包](https://www.nuget.org/packages/Microsoft.Web.WebView2/1.0.3537.50)。便携包携带 x64 加载器及其许可和通知，扫码登录使用系统的 WebView2 Runtime。
+
 - **libmpv**：提交 `e471496c56`，shinchiro Windows x86_64 构建 `20261021`。由 [mpv 官方安装页](https://mpv.io/installation/)列出的第三方构建，包含 FFmpeg 等媒体依赖。[构建配方与依赖源码来源](https://github.com/shinchiro/mpv-winbuild-cmake/tree/20261021)，[mpv 对应源码](https://github.com/mpv-player/mpv/tree/e471496c56)。版权、许可见 `licenses/mpv-*`。
 - **yt-dlp**：官方独立可执行文件 `2026.10.26`。[源码与构建说明](https://github.com/yt-dlp/yt-dlp/tree/2026.10.26)。主项目使用 Unlicense，独立可执行文件包含其他许可的依赖，详见上游许可章节与 `licenses/yt-dlp-LICENSE`。
 - **nlohmann/json**：`3.11.3`，MIT，Copyright (c) 2013-2023 Niels Lohmann，仅构建使用。[对应源码](https://github.com/nlohmann/json/tree/v3.11.3)，许可见 `licenses/json-LICENSE.MIT`。
