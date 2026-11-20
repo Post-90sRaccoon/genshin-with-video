@@ -447,6 +447,11 @@ int main(){
     INITCOMMONCONTROLSEX controls={sizeof(controls),ICC_STANDARD_CLASSES|ICC_WIN95_CLASSES};InitCommonControlsEx(&controls);
     HWND host=CreateWindowExW(0,L"STATIC",L"Controller test",WS_POPUP,0,0,480,320,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
     try{
+        WNDCLASSW repaintFixture={};
+        repaintFixture.hInstance=GetModuleHandleW(nullptr);
+        repaintFixture.lpfnWndProc=DefWindowProcW;
+        repaintFixture.lpszClassName=L"GenshinVideoRepaintFixture";
+        expect(RegisterClassW(&repaintFixture)!=0,"register repaint fixture");
         {
             App diagnosticMenu;HMENU menu=diagnosticMenu.context_menu();wchar_t label[80]={};
             GetMenuStringW(menu,113,label,80,MF_BYCOMMAND);DestroyMenu(menu);
@@ -556,13 +561,32 @@ int main(){
             expect(persisted.data["settings"].value("speed",1.0)==1.5,"chosen speed is saved immediately");
         }
         {
-            HWND ui=CreateWindowExW(0,L"STATIC",L"Toolbar fixture",WS_POPUP|WS_THICKFRAME,0,0,330,230,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+            HWND ui=CreateWindowExW(0,repaintFixture.lpszClassName,L"Toolbar fixture",WS_POPUP|WS_THICKFRAME|WS_CLIPCHILDREN,-10000,-10000,330,230,nullptr,nullptr,repaintFixture.hInstance,nullptr);
             expect(ui!=nullptr,"toolbar fixture window");
             App toolbar;toolbar.window=ui;toolbar.store=Store(executable_dir()+L"\\speed-toolbar-test-data");
             toolbar.settings=Settings{};toolbar.settings.speed=1.75;
             for(size_t i=0;i<toolbar.settings.hotkeys.size();++i)toolbar.settings.hotkeys[i]=MAKEWORD(VK_F13+static_cast<BYTE>(i),HOTKEYF_CONTROL|HOTKEYF_ALT);
             toolbar.init();
             expect(GetDlgItem(ui,SPEED)!=nullptr,"speed has a visible toolbar entry");
+            RECT videoArea;
+            GetWindowRect(toolbar.video,&videoArea);
+            MapWindowPoints(nullptr,ui,reinterpret_cast<POINT*>(&videoArea),2);
+            // Windows only maintains an update region for a shown window.
+            ShowWindow(ui,SW_SHOWNOACTIVATE);
+            ValidateRect(ui,nullptr);
+            toolbar.busy=true;
+            toolbar.update_status();
+            RECT repaint={};
+            GetUpdateRect(ui,&repaint,FALSE);
+            expect(repaint.top<=videoArea.top && repaint.bottom>=videoArea.bottom,
+                   "starting a load repaints the stage when the video child is already hidden");
+            ValidateRect(ui,nullptr);
+            toolbar.update_status();
+            expect(!GetUpdateRect(ui,nullptr,FALSE),"an unchanged loading state leaves the stage undisturbed");
+            toolbar.busy=false;
+            toolbar.update_status();
+            ShowWindow(ui,SW_HIDE);
+            SetWindowPos(ui,nullptr,0,0,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
             toolbar.command(204);
             wchar_t label[32]={};GetWindowTextW(GetDlgItem(ui,SPEED),label,32);
             expect(std::wstring(label)==L"1.5×","toolbar label follows the selected speed");
@@ -673,6 +697,28 @@ int main(){
         do{MSG msg;while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)){TranslateMessage(&msg);DispatchMessageW(&msg);}app.player.drain();app.state=app.player.snapshot();if(app.state.loaded)break;Sleep(10);}while(GetTickCount64()<deadline);
         expect(app.state.loaded && app.state.position>12,"local paused fixture loaded");
         expect(app.state.position_valid,"loaded playhead must be explicitly valid");
+        {
+            HWND footer=CreateWindowExW(0,repaintFixture.lpszClassName,L"Progress fixture",WS_POPUP,
+                                       -10000,-10000,480,320,nullptr,nullptr,repaintFixture.hInstance,nullptr);
+            expect(footer!=nullptr,"progress fixture window");
+            app.window=footer;
+            ShowWindow(footer,SW_SHOWNOACTIVATE);
+            const auto snapshot=app.state;
+            app.hotkeyWarning="shortcut unavailable";
+            app.update_status();
+            ValidateRect(footer,nullptr);
+            app.state.position+=5;
+            app.update_status();
+            RECT client={},repaint={};
+            GetClientRect(footer,&client);
+            expect(GetUpdateRect(footer,&repaint,FALSE) && repaint.top==client.bottom-app.bottom,
+                   "playback progress repaints while a persistent warning occupies the status text");
+            app.state=snapshot;
+            app.hotkeyWarning.clear();
+            app.window=host;
+            DestroyWindow(footer);
+            app.update_status();
+        }
         {
             auto before=app.player.snapshot();auto properties=app.player.diagnostic_snapshot();
             expect(properties["values"]["time-pos"].is_number() && properties["status"]["time-pos"]==0,"diagnostics keep a valid numeric media clock");

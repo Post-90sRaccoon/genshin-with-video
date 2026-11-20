@@ -25,7 +25,32 @@ constexpr UINT JOB_DONE=WM_APP+1,MEDIA_EVENT=WM_APP+2,TRAY_EVENT=WM_APP+3,SHOW_E
 const UINT TASKBAR_CREATED=RegisterWindowMessageW(L"TaskbarCreated");
 enum Command { OPEN=100,PARTS,SETTINGS,HIDE,PAUSE,PREVIOUS,NEXT,RETRY,FROM_START,PASS_THROUGH,QUIT,SPEED,MENU_BAR,SAVE_DIAGNOSTICS,BILI_LOGIN,BILI_LOGOUT,BILI_ACCOUNT_LABEL };
 constexpr int SPEED_FIRST=200;
+constexpr int TOOLBAR_HEIGHT=34,STATUS_HEIGHT=25;
 enum class RetrySource { Extractor,PublicApi };
+enum class Stage { Empty,Loading,Error,Video };
+namespace ui {
+constexpr COLORREF chrome=RGB(25,33,44);
+constexpr COLORREF canvas=RGB(15,21,29);
+constexpr COLORREF border=RGB(47,62,78);
+constexpr COLORREF text=RGB(232,240,248);
+constexpr COLORREF secondary=RGB(168,184,200);
+constexpr COLORREF muted=RGB(101,121,141);
+constexpr COLORREF accent=RGB(117,224,204);
+constexpr COLORREF warning=RGB(248,183,115);
+
+void fill(HDC dc,const RECT& rect,COLORREF color){
+    SetDCBrushColor(dc,color);
+    FillRect(dc,&rect,static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+}
+
+void rounded(HDC dc,const RECT& rect,int diameter,COLORREF background,COLORREF outline){
+    SelectObject(dc,GetStockObject(DC_BRUSH));
+    SelectObject(dc,GetStockObject(DC_PEN));
+    SetDCBrushColor(dc,background);
+    SetDCPenColor(dc,outline);
+    RoundRect(dc,rect.left,rect.top,rect.right,rect.bottom,diameter,diameter);
+}
+}
 struct Result {unsigned generation=0;VideoRef ref;std::shared_ptr<Guide> guide;Resume resume;Media media;bool public_streams=false,login_fallback=false;std::string error;
     bool preparation=false;unsigned preparation_epoch=0;int64_t entry=-1;long long cid=0;int quality=0;std::wstring cookies;ULONGLONG prepared_at=0,elapsed_ms=0;double video_end=0;json extraction_failure=json::object();
 };
@@ -80,13 +105,16 @@ std::wstring speed_text(double speed){std::wostringstream text;text<<speed<<L"×
 PlaybackDiagnostics& app_diagnostics(){static PlaybackDiagnostics recorder(executable_dir()+L"\\data\\diagnostics");return recorder;}
 class App {
 public:
-    HWND window=nullptr,video=nullptr,statusLabel=nullptr;HFONT font=nullptr;Store store;Settings settings;Player player;
+    HWND window=nullptr,video=nullptr,statusLabel=nullptr,hoveredButton=nullptr;
+    HFONT font=nullptr,titleFont=nullptr;Store store;Settings settings;Player player;
     std::shared_ptr<const BiliSession> loginSession;
     std::shared_ptr<Guide> guide;size_t index=0;VideoRef requested;
     std::vector<std::unique_ptr<Job>> jobs;std::mutex resultsMutex;std::deque<std::unique_ptr<Result>> results;
     std::atomic<bool> closing{false};unsigned generation=0;bool busy=false,desiredPaused=false,hidden=false,pass=false,modal=false,refreshUsed=false,applyIntentOnLoad=false,hadPlayback=false;
     std::array<bool,HOTKEY_COUNT> registered{};std::string message,lastError,storageWarning,hotkeyWarning;std::wstring status;Snapshot state;double lastPosition=0;int lastSave=0;
-    UINT dpi=96;int top=34,bottom=25;std::array<HWND,6> buttons{};NOTIFYICONDATAW tray={};bool trayAdded=false;ULONGLONG loadStarted=0;
+    UINT dpi=96;int top=TOOLBAR_HEIGHT,bottom=STATUS_HEIGHT;std::array<HWND,6> buttons{};NOTIFYICONDATAW tray={};bool trayAdded=false;ULONGLONG loadStarted=0;
+    Stage stage=Stage::Empty;
+    double footerProgress=0;
     long long renewedDeadline=0;
     PlaybackDiagnostics* diagnostics=&app_diagnostics();ULONGLONG lastDiagnostic=0;
     unsigned videoRecoveryAttempts=0;int64_t videoCandidateEntry=-1;ULONGLONG videoCandidateSince=0;double videoCandidateEnd=0;bool menuActive=false;
@@ -98,7 +126,7 @@ public:
     std::optional<RECT> resizeScreen,dpiScreen;bool resizing=false;
     RECT frameInsets={};UINT frameDpi=96;bool frameMeasured=false;
     explicit App():store(account_directory()),settings(read_settings(store.data["settings"])) {storageWarning=store.warning;}
-    ~App(){closing=true;for(auto& j:jobs)j->cancel->cancel();for(auto& j:jobs)if(j->thread.joinable())j->thread.join();player.shutdown();if(font)DeleteObject(font);}
+    ~App(){closing=true;for(auto& j:jobs)j->cancel->cancel();for(auto& j:jobs)if(j->thread.joinable())j->thread.join();player.shutdown();if(font)DeleteObject(font);if(titleFont)DeleteObject(titleFont);}
     json diagnostic_context(){
         json context={{"generation",generation},{"bvid",requested.bvid},{"page",requested.page},{"source",store.data.value("last_source",std::string())},{"quality",settings.quality},{"speed",settings.speed},{"desired_paused",desiredPaused},{"hidden",hidden},{"busy",busy},{"build_stamp",__DATE__ " " __TIME__},{"streams",player.diagnostic_source()}};
         if(!busy && guide && guide->bvid==requested.bvid && index<guide->parts.size() && (!requested.page || guide->parts[index].page==requested.page)){context["bvid"]=guide->bvid;context["page"]=guide->parts[index].page;context["cid"]=guide->parts[index].cid;}
@@ -117,13 +145,47 @@ public:
         return path;
     }
     int scale(int v) const{return MulDiv(v,dpi,96);}
-    void set_font(){if(font)DeleteObject(font);font=CreateFontW(-scale(13),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei UI");for(auto b:buttons)if(b)SendMessageW(b,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);if(statusLabel)SendMessageW(statusLabel,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);}
+    HFONT make_font(int size,int weight) const{
+        return CreateFontW(-scale(size),0,0,0,weight,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
+                           OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei UI");
+    }
+    void set_font(){
+        HFONT oldFont=font,oldTitle=titleFont;
+        font=make_font(13,FW_NORMAL);
+        titleFont=make_font(21,FW_SEMIBOLD);
+        for(HWND button:buttons)if(button)SendMessageW(button,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
+        if(statusLabel)SendMessageW(statusLabel,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
+        if(oldFont)DeleteObject(oldFont);
+        if(oldTitle)DeleteObject(oldTitle);
+    }
+    void hover_button(HWND button){
+        if(hoveredButton==button)return;
+        if(hoveredButton)InvalidateRect(hoveredButton,nullptr,FALSE);
+        hoveredButton=button;
+        if(button)InvalidateRect(button,nullptr,FALSE);
+    }
+    static LRESULT CALLBACK button_proc(HWND button,UINT msg,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR data){
+        auto& app=*reinterpret_cast<App*>(data);
+        if(msg==WM_MOUSEMOVE && app.hoveredButton!=button){
+            TRACKMOUSEEVENT track={sizeof(track),TME_LEAVE,button,0};
+            if(TrackMouseEvent(&track))app.hover_button(button);
+        }
+        if((msg==WM_MOUSELEAVE || (msg==WM_SHOWWINDOW && !w) || msg==WM_NCDESTROY) &&
+           app.hoveredButton==button)app.hover_button(nullptr);
+        if(msg==WM_NCDESTROY)RemoveWindowSubclass(button,button_proc,id);
+        return DefSubclassProc(button,msg,w,l);
+    }
     void init(){
-        dpi=GetDpiForWindow(window);top=settings.menu_bar_visible?scale(34):0;bottom=scale(25);set_font();
+        dpi=GetDpiForWindow(window);
+        top=settings.menu_bar_visible?scale(TOOLBAR_HEIGHT):0;
+        bottom=scale(STATUS_HEIGHT);
         video=CreateWindowExW(0,L"STATIC",L"",WS_CHILD|WS_CLIPCHILDREN|WS_CLIPSIBLINGS,0,top,480,270,window,nullptr,GetModuleHandleW(nullptr),nullptr);
         const wchar_t* labels[]={L"打开",L"选集",L"设置",L"隐藏",L"播放",L"1×"};int ids[]={OPEN,PARTS,SETTINGS,HIDE,PAUSE,SPEED};
-        for(size_t i=0;i<buttons.size();++i)buttons[i]=CreateWindowExW(0,L"BUTTON",labels[i],WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,0,0,0,0,window,reinterpret_cast<HMENU>(static_cast<INT_PTR>(ids[i])),GetModuleHandleW(nullptr),nullptr);
-        statusLabel=CreateWindowExW(0,L"STATIC",L"",WS_CHILD|WS_VISIBLE|SS_ENDELLIPSIS|SS_CENTERIMAGE,0,0,0,0,window,nullptr,GetModuleHandleW(nullptr),nullptr);
+        for(size_t i=0;i<buttons.size();++i){
+            buttons[i]=CreateWindowExW(0,L"BUTTON",labels[i],WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,0,0,0,0,window,reinterpret_cast<HMENU>(static_cast<INT_PTR>(ids[i])),GetModuleHandleW(nullptr),nullptr);
+            if(buttons[i])SetWindowSubclass(buttons[i],button_proc,1,reinterpret_cast<DWORD_PTR>(this));
+        }
+        statusLabel=CreateWindowExW(0,L"STATIC",L"",WS_CHILD|WS_VISIBLE|SS_ENDELLIPSIS|SS_CENTERIMAGE|SS_NOPREFIX,0,0,0,0,window,nullptr,GetModuleHandleW(nullptr),nullptr);
         set_font();register_keys();
         add_tray();
         if(!trayAdded && !registered[1])message="显示热键不可用，且无法创建托盘图标；请先在设置中更换热键";
@@ -182,12 +244,27 @@ public:
         RECT before;if(!GetWindowRect(window,&before))return;RECT rect=before;fit_rect(rect,active_screen_area());
         if(!EqualRect(&rect,&before))SetWindowPos(window,HWND_TOPMOST,rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,SWP_NOACTIVATE);
     }
+    RECT stage_bounds() const{
+        RECT area={};
+        GetClientRect(window,&area);
+        area.top=top;
+        area.bottom=std::max<LONG>(0,area.bottom-bottom);
+        return area;
+    }
     void layout(){
-        top=settings.menu_bar_visible?scale(34):0;
-        RECT r;GetClientRect(window,&r);int x=scale(18),gap=scale(4),width=std::min(scale(55),std::max(1,(static_cast<int>(r.right)-scale(26)-gap*5)/6));
-        for(auto b:buttons){if(b){MoveWindow(b,x,scale(4),width,scale(26),TRUE);ShowWindow(b,settings.menu_bar_visible?SW_SHOWNOACTIVATE:SW_HIDE);}x+=width+gap;}
-        if(video)MoveWindow(video,0,top,r.right,std::max<LONG>(1,r.bottom-top-bottom),TRUE);
-        if(statusLabel)MoveWindow(statusLabel,scale(8),r.bottom-bottom,std::max<LONG>(1,r.right-scale(16)),bottom,TRUE);
+        top=settings.menu_bar_visible?scale(TOOLBAR_HEIGHT):0;
+        RECT r=stage_bounds();
+        const int start=scale(22),end=scale(8),gap=scale(4),groupGap=scale(8);
+        const int width=std::clamp((static_cast<int>(r.right)-start-end-gap*4-groupGap)/6,1,scale(54));
+        const int rightGroup=std::max(start+3*width+2*gap+groupGap,static_cast<int>(r.right)-end-3*width-2*gap);
+        for(size_t i=0;i<buttons.size();++i){
+            if(!buttons[i])continue;
+            const int x=(i<3?start:rightGroup)+static_cast<int>(i%3)*(width+gap);
+            MoveWindow(buttons[i],x,scale(4),width,scale(26),TRUE);
+            ShowWindow(buttons[i],settings.menu_bar_visible?SW_SHOWNOACTIVATE:SW_HIDE);
+        }
+        if(video)MoveWindow(video,0,r.top,r.right,std::max<LONG>(1,r.bottom-r.top),TRUE);
+        if(statusLabel)MoveWindow(statusLabel,scale(25),r.bottom+scale(2),std::max<LONG>(1,r.right-scale(34)),bottom-scale(2),TRUE);
         InvalidateRect(window,nullptr,FALSE);
     }
     void constrain_size(UINT edge,RECT& rect,const RECT* screen=nullptr){
@@ -316,7 +393,12 @@ public:
         }
         cleanup_jobs();update_status();
     }
-    void fail(const std::string& error){busy=false;loadStarted=0;applyIntentOnLoad=false;lastError=error;message=error;ShowWindow(video,SW_HIDE);update_status();InvalidateRect(window,nullptr,TRUE);}
+    void fail(const std::string& error){
+        busy=false;loadStarted=0;applyIntentOnLoad=false;lastError=error;message=error;
+        ShowWindow(video,SW_HIDE);
+        if(stage==Stage::Error){RECT area=stage_bounds();InvalidateRect(window,&area,FALSE);}
+        update_status();
+    }
     bool renew_source(long long now){
         if(busy || modal || hidden || desiredPaused || !lastError.empty() || !state.error.empty() || !state.loaded || !state.position_valid || state.paused || state.seeking || state.eof || requested.bvid.empty())return false;
         if(state.source_deadline<=0 || state.source_deadline<=renewedDeadline || state.source_deadline-now>60)return false;
@@ -429,19 +511,48 @@ public:
         }auto now=GetTickCount64();if(try_prepared_handoff(now))return;prepare_video_input(now);if(recover_video_input(now))return;if(!preparationCancel && !prepared && renew_source(static_cast<long long>(std::time(nullptr))))return;update_status();}
     void timer(){accept_results();sync();auto now=GetTickCount64();if(now-lastDiagnostic>=2000){lastDiagnostic=now;capture_diagnostics("periodic");}if(++lastSave>=10){lastSave=0;if(state.loaded && !state.paused)save_safely();}}
     void update_status(){
+        const RECT area=stage_bounds();
+        Stage nextStage=Stage::Empty;
+        if(busy)nextStage=Stage::Loading;
+        else if(!lastError.empty())nextStage=Stage::Error;
+        else if(player.initialized())nextStage=Stage::Video;
+        if(nextStage!=stage){
+            stage=nextStage;
+            if(window)InvalidateRect(window,&area,FALSE);
+        }
+        double progress=0;
+        if(stage==Stage::Video && state.loaded && state.position_valid && state.duration>0 &&
+           std::isfinite(state.position) && std::isfinite(state.duration))
+            progress=std::clamp(state.position/state.duration,0.0,1.0);
+        if(window && std::lround(area.right*progress)!=std::lround(area.right*footerProgress)){
+            RECT track={0,area.bottom,area.right,area.bottom+scale(2)};
+            InvalidateRect(window,&track,FALSE);
+        }
+        footerProgress=progress;
         std::wstring value;
         if(busy)value=L"正在加载…  再次打开可切换链接";
         else if(!lastError.empty())value=wide(lastError);
         else if(guide && !state.loaded && applyIntentOnLoad)value=L"P"+std::to_wstring(guide->parts[index].page)+L" · 正在解析和加载视频…";
         else if(guide){const auto& p=guide->parts.at(index);value=L"P"+std::to_wstring(p.page)+L"/"+std::to_wstring(guide->parts.size())+L"  ·  "+std::to_wstring(state.height)+L"p  ·  "+speed_text(settings.speed)+L"  ·  "+clock_text(state.loaded && state.position_valid?state.position:lastPosition)+L" / "+clock_text(state.duration>0?state.duration:p.duration)+L"  ·  "+(state.paused?L"已暂停":L"播放中");if(pass)value+=L"  ·  鼠标穿透";}
-        else value=message.empty()?(settings.menu_bar_visible?L"打开 B 站链接开始  ·  可拖动上方空白处移动":L"右键打开 B 站链接  ·  可拖动底部状态栏移动"):wide(message);
+        else value=message.empty()?(settings.menu_bar_visible?L"可拖动顶部空白处移动":L"可拖动底部状态栏移动"):wide(message);
         if(guide && !busy && lastError.empty() && !message.empty())value+=L"  ·  "+wide(message);
         if(!hotkeyWarning.empty())value=wide(hotkeyWarning);
         if(!storageWarning.empty())value=wide(storageWarning);
-        if(status!=value){status=value;if(statusLabel)SetWindowTextW(statusLabel,status.c_str());RECT r;GetClientRect(window,&r);r.top=r.bottom-bottom;InvalidateRect(window,&r,FALSE);}
-        if(buttons[4])SetWindowTextW(buttons[4],desiredPaused || !guide?L"播放":L"暂停");
-        if(buttons[5])SetWindowTextW(buttons[5],speed_text(settings.speed).c_str());
+        if(status!=value){
+            status=value;
+            if(statusLabel)SetWindowTextW(statusLabel,status.c_str());
+            RECT footer={0,area.bottom,area.right,area.bottom+bottom};
+            if(window)InvalidateRect(window,&footer,FALSE);
+        }
+        update_button_label(buttons[4],desiredPaused || !guide?L"播放":L"暂停");
+        update_button_label(buttons[5],speed_text(settings.speed));
         std::wstring title=L"原神攻略小窗";if(guide)title+=L" · P"+std::to_wstring(guide->parts[index].page)+L" · "+wide(guide->parts[index].title);SetWindowTextW(window,title.c_str());
+    }
+    void update_button_label(HWND button,const std::wstring& value){
+        if(!button)return;
+        wchar_t current[32]={};
+        GetWindowTextW(button,current,static_cast<int>(std::size(current)));
+        if(value!=current)SetWindowTextW(button,value.c_str());
     }
     void set_pass(bool enabled){if(enabled && !registered[0]){MessageBoxW(window,L"鼠标穿透解除热键被其他程序占用。请先在设置里更换该热键。",L"需要可用的解除热键",MB_OK|MB_ICONINFORMATION);return;}pass=enabled;LONG_PTR style=GetWindowLongPtrW(window,GWL_EXSTYLE);if(enabled){style|=WS_EX_TRANSPARENT|WS_EX_LAYERED;SetWindowLongPtrW(window,GWL_EXSTYLE,style);SetLayeredWindowAttributes(window,0,255,LWA_ALPHA);}else{style&=~(WS_EX_TRANSPARENT|WS_EX_LAYERED);SetWindowLongPtrW(window,GWL_EXSTYLE,style);}SetWindowPos(window,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_FRAMECHANGED);PostMessageW(window,FRAME_READY,0,0);update_status();}
     void toggle_hidden(){if(!hidden){if(!registered[1] && !trayAdded){MessageBoxW(window,L"显示热键被占用，且托盘图标不可用。请先更换显示热键。",L"无法安全隐藏",MB_OK);return;}desiredPaused=true;player.set_pause(true);sync();save_safely();hidden=true;ShowWindow(window,SW_HIDE);}else{hidden=false;desiredPaused=true;player.set_pause(true);ShowWindow(window,SW_SHOWNOACTIVATE);SetWindowPos(window,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);PostMessageW(window,FRAME_READY,0,0);sync();}update_status();}
@@ -487,6 +598,7 @@ public:
         if(target>=0)open_part(static_cast<size_t>(target));
     }
     void focus_dialog(bool begin){LONG_PTR style=GetWindowLongPtrW(window,GWL_EXSTYLE);SetWindowLongPtrW(window,GWL_EXSTYLE,begin?style&~WS_EX_NOACTIVATE:style|WS_EX_NOACTIVATE);}
+    bool can_retry() const{return !requested.bvid.empty() || requested.short_url;}
     void command(int id){
         if(modal || closing)return;
         if(id==SAVE_DIAGNOSTICS){save_fault_report();return;}
@@ -494,7 +606,7 @@ public:
         if(id==SPEED){show_speed_menu();return;}
         if(id==MENU_BAR){toggle_menu_bar();return;}
         if(id==PAUSE){pause();return;}if(id==HIDE){toggle_hidden();return;}if(id==PASS_THROUGH){set_pass(!pass);return;}if(id==PREVIOUS){next(-1);return;}if(id==NEXT){next(1);return;}if(id==QUIT){PostMessageW(window,WM_CLOSE,0,0);return;}
-        if(id==RETRY){capture_diagnostics("before-manual-retry");if(!requested.bvid.empty() || requested.short_url)open(requested,true);return;}
+        if(id==RETRY){capture_diagnostics("before-manual-retry");if(can_retry())open(requested,true);return;}
         if(id==FROM_START){if(guide && !busy)open(requested,true,false,0.0);return;}
         HWND previous=GetForegroundWindow();bool wasPass=pass;if(pass)set_pass(false);focus_dialog(true);reset_video_candidate();modal=true;
         std::optional<std::string> url;std::optional<size_t> part;std::optional<Settings> changed;
@@ -550,7 +662,7 @@ public:
         HMENU menu=CreatePopupMenu();auto add=[&](int id,const wchar_t* label,bool enabled=true,bool checked=false){AppendMenuW(menu,MF_STRING|(enabled?0:MF_GRAYED)|(checked?MF_CHECKED:0),id,label);};
         add(OPEN,L"打开 B 站链接…");add(PARTS,L"选择分 P…",guide!=nullptr);AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
         add(PAUSE,desiredPaused?L"继续播放":L"暂停",guide!=nullptr || busy);AppendMenuW(menu,MF_POPUP,reinterpret_cast<UINT_PTR>(speed_menu()),L"播放速度");
-        add(PREVIOUS,L"上一 P",guide && index>0 && !busy);add(NEXT,L"下一 P",guide && index+1<guide->parts.size() && !busy);add(FROM_START,L"当前 P 从头播放",guide!=nullptr && !busy);add(RETRY,L"重试当前分 P",!requested.bvid.empty() || requested.short_url);AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
+        add(PREVIOUS,L"上一 P",guide && index>0 && !busy);add(NEXT,L"下一 P",guide && index+1<guide->parts.size() && !busy);add(FROM_START,L"当前 P 从头播放",guide!=nullptr && !busy);add(RETRY,L"重试当前分 P",can_retry());AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
         auto menuLabel=L"显示菜单栏\t"+hotkey_name(settings.hotkeys[8]);add(MENU_BAR,menuLabel.c_str(),true,settings.menu_bar_visible);
         add(PASS_THROUGH,L"鼠标穿透（快捷键可解除）",true,pass);add(HIDE,hidden?L"显示小窗（保持暂停）":L"隐藏并暂停");
         AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
@@ -567,8 +679,163 @@ public:
         add(SETTINGS,L"设置 / 快捷键…");add(SAVE_DIAGNOSTICS,L"保存故障现场");AppendMenuW(menu,MF_SEPARATOR,0,nullptr);add(QUIT,L"退出");return menu;
     }
     void menu(POINT point){HWND previous=GetForegroundWindow();HMENU menu=context_menu();SetForegroundWindow(window);reset_video_candidate();bool priorMenu=menuActive;menuActive=true;int id=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,point.x,point.y,0,window,nullptr);menuActive=priorMenu;reset_video_candidate();DestroyMenu(menu);PostMessageW(window,WM_NULL,0,0);if(previous && previous!=window && IsWindow(previous))SetForegroundWindow(previous);if(id)command(id);}
-    void paint(){PAINTSTRUCT p;HDC dc=BeginPaint(window,&p);RECT r;GetClientRect(window,&r);HBRUSH bg=CreateSolidBrush(RGB(21,25,31));FillRect(dc,&r,bg);DeleteObject(bg);SetBkMode(dc,TRANSPARENT);SelectObject(dc,font);SetTextColor(dc,RGB(183,194,204));if(top){RECT grip={scale(4),0,scale(18),top};DrawTextW(dc,L"⠿",-1,&grip,DT_CENTER|DT_VCENTER|DT_SINGLELINE);}RECT s=r;s.top=r.bottom-bottom;s.left=scale(10);s.right-=scale(8);DrawTextW(dc,status.c_str(),-1,&s,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS);if(!player.initialized() || busy || !lastError.empty()){RECT body={scale(24),top+scale(18),r.right-scale(24),r.bottom-bottom-scale(10)};std::wstring text=busy?L"正在打开攻略…\n\n可以继续操作游戏，加载完成后开始播放。":!lastError.empty()?wide(lastError)+L"\n\n右键 → 重试当前分 P，或打开其他链接。":std::wstring(L"攻略就在游戏旁边\n\n打开 B 站链接，选择你的路线\n暂停、倒退、继续都可以用快捷键\n\n")+(settings.menu_bar_visible?L"右键打开菜单 · 拖动上方空白处移动":L"右键显示菜单栏 · 拖动底部状态栏移动");DrawTextW(dc,text.c_str(),-1,&body,DT_CENTER|DT_WORDBREAK);}EndPaint(window,&p);}
-    void draw_button(DRAWITEMSTRUCT* item){HBRUSH b=CreateSolidBrush((item->itemState&ODS_SELECTED)?RGB(49,80,80):RGB(35,43,52));FillRect(item->hDC,&item->rcItem,b);DeleteObject(b);SetBkMode(item->hDC,TRANSPARENT);SetTextColor(item->hDC,RGB(224,233,239));SelectObject(item->hDC,font);wchar_t label[64];GetWindowTextW(item->hwndItem,label,64);DrawTextW(item->hDC,label,-1,&item->rcItem,DT_CENTER|DT_VCENTER|DT_SINGLELINE);}
+    void draw_stage_icon(HDC dc,int x,int y){
+        const COLORREF ink=stage==Stage::Error?ui::warning:ui::accent;
+        RECT tile={x-scale(20),y-scale(20),x+scale(20),y+scale(20)};
+        ui::rounded(dc,tile,scale(12),ui::chrome,ui::border);
+        SetDCPenColor(dc,ink);
+        SetDCBrushColor(dc,ink);
+        if(stage==Stage::Error){
+            RECT line={x-scale(1),y-scale(8),x+scale(1),y+scale(2)};
+            RECT dot={x-scale(1),y+scale(5),x+scale(1),y+scale(7)};
+            ui::fill(dc,line,ink);
+            ui::fill(dc,dot,ink);
+        }else if(stage==Stage::Loading){
+            POINT hourglass[]={{x-scale(6),y-scale(7)},{x+scale(6),y-scale(7)},
+                               {x-scale(6),y+scale(7)},{x+scale(6),y+scale(7)},{x-scale(6),y-scale(7)}};
+            Polyline(dc,hourglass,static_cast<int>(std::size(hourglass)));
+        }else{
+            POINT play[]={{x-scale(4),y-scale(7)},{x+scale(7),y},{x-scale(4),y+scale(7)}};
+            Polygon(dc,play,static_cast<int>(std::size(play)));
+        }
+    }
+    void draw_stage(HDC dc,const RECT& area){
+        const int padding=scale(18);
+        if(area.right-area.left<=2*padding)return;
+        const int saved=SaveDC(dc);
+        if(!saved)return;
+        IntersectClipRect(dc,area.left,area.top,area.right,area.bottom);
+        const wchar_t* heading=settings.menu_bar_visible?L"打开一条攻略":L"右键打开攻略";
+        std::wstring detail=L"支持 B 站链接和 BV 号，打开后可切换分 P。";
+        if(stage==Stage::Loading){
+            heading=L"正在打开攻略";
+            detail=L"正在读取视频信息，可以继续操作游戏。";
+        }else if(stage==Stage::Error){
+            heading=L"攻略加载或播放失败";
+            detail=wide(lastError);
+        }
+
+        const int headingHeight=scale(29),gap=scale(3);
+        RECT measured={area.left+padding,0,area.right-padding,0};
+        const UINT detailFormat=DT_CENTER|DT_WORDBREAK|DT_NOPREFIX;
+        SelectObject(dc,font);
+        DrawTextW(dc,detail.c_str(),-1,&measured,detailFormat|DT_CALCRECT);
+        const int detailHeight=std::min(static_cast<int>(measured.bottom),scale(38));
+        const int hintHeight=stage==Stage::Error?scale(22):0;
+        const int textHeight=headingHeight+gap+detailHeight+hintHeight;
+        const int available=area.bottom-area.top;
+        const bool showIcon=available>=textHeight+scale(58);
+        const int iconHeight=showIcon?scale(50):0;
+        int y=area.top+std::max(scale(4),(available-textHeight-iconHeight)/2);
+        if(showIcon){
+            draw_stage_icon(dc,(area.left+area.right)/2,y+scale(20));
+            y+=iconHeight;
+        }
+
+        SetBkMode(dc,TRANSPARENT);
+        SetTextColor(dc,ui::text);
+        if(titleFont)SelectObject(dc,titleFont);
+        RECT title={area.left+padding,y,area.right-padding,y+headingHeight};
+        DrawTextW(dc,heading,-1,&title,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
+
+        SelectObject(dc,font);
+        SetTextColor(dc,ui::secondary);
+        y=title.bottom+gap;
+        RECT body={title.left,y,title.right,y+detailHeight};
+        DrawTextW(dc,detail.c_str(),-1,&body,detailFormat|DT_END_ELLIPSIS|DT_EDITCONTROL);
+        if(hintHeight){
+            RECT retry={title.left,body.bottom+gap,title.right,body.bottom+hintHeight};
+            SetTextColor(dc,ui::warning);
+            const wchar_t* action=can_retry()?L"右键可重试当前分 P":L"右键可打开其他链接";
+            DrawTextW(dc,action,-1,&retry,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
+        }
+        RestoreDC(dc,saved);
+    }
+    COLORREF status_color() const{
+        if(stage==Stage::Error || !storageWarning.empty() || !hotkeyWarning.empty())return ui::warning;
+        if(stage==Stage::Loading || (state.loaded && !state.paused))return ui::accent;
+        return ui::muted;
+    }
+    void draw_client(HDC dc,const RECT& damage){
+        RECT client={};
+        GetClientRect(window,&client);
+        ui::fill(dc,damage,ui::canvas);
+        if(top){
+            ui::fill(dc,{0,0,client.right,top},ui::chrome);
+            ui::fill(dc,{0,top-1,client.right,top},ui::border);
+            for(int row=0;row<3;++row){
+                for(int column=0;column<2;++column){
+                    const int x=scale(8+4*column),y=top/2+scale(4*row-5);
+                    ui::fill(dc,{x,y,x+scale(2),y+scale(2)},ui::muted);
+                }
+            }
+        }
+        RECT area=stage_bounds(),overlap;
+        if(stage!=Stage::Video && IntersectRect(&overlap,&area,&damage))draw_stage(dc,area);
+        const int footer=client.bottom-bottom;
+        ui::fill(dc,{0,footer,client.right,client.bottom},ui::chrome);
+        ui::fill(dc,{0,footer,client.right,footer+1},ui::border);
+        const auto progressWidth=static_cast<LONG>(std::lround(client.right*footerProgress));
+        if(progressWidth>0)ui::fill(dc,{0,footer,progressWidth,footer+scale(2)},ui::accent);
+        RECT dot={scale(11),footer+scale(10),scale(17),footer+scale(16)};
+        const COLORREF color=status_color();
+        ui::rounded(dc,dot,scale(6),color,color);
+    }
+    void paint(){
+        PAINTSTRUCT paint;
+        HDC dc=BeginPaint(window,&paint);
+        draw_client(dc,paint.rcPaint);
+        EndPaint(window,&paint);
+    }
+    void draw_button(const DRAWITEMSTRUCT& item){
+        HDC dc=item.hDC;
+        const int saved=SaveDC(dc);
+        if(!saved)return;
+        ui::fill(dc,item.rcItem,ui::chrome);
+        const bool pressed=(item.itemState&ODS_SELECTED)!=0;
+        const bool hovered=item.hwndItem==hoveredButton;
+        const bool disabled=(item.itemState&ODS_DISABLED)!=0;
+        const bool focused=(item.itemState&ODS_FOCUS)!=0 && !(item.itemState&ODS_NOFOCUSRECT);
+        const bool primary=item.CtlID==OPEN && !disabled;
+        COLORREF fill=RGB(33,44,57),border=ui::border,ink=ui::text;
+        if(primary){
+            fill=pressed?RGB(81,176,161):hovered?RGB(151,242,222):ui::accent;
+            border=fill;
+            ink=ui::canvas;
+        }else if(disabled){
+            fill=ui::chrome;
+            ink=ui::muted;
+        }else if(pressed || hovered){
+            fill=pressed?RGB(41,69,76):RGB(44,60,76);
+            border=ui::muted;
+        }
+        RECT shape=item.rcItem;
+        --shape.bottom;
+        ui::rounded(dc,shape,scale(9),fill,border);
+        if(focused){
+            RECT focus=shape;
+            InflateRect(&focus,-scale(2),-scale(2));
+            DrawFocusRect(dc,&focus);
+        }
+
+        SetBkMode(dc,TRANSPARENT);
+        SetTextColor(dc,ink);
+        SelectObject(dc,font);
+        wchar_t label[32]={};
+        const int length=GetWindowTextW(item.hwndItem,label,static_cast<int>(std::size(label)));
+        RECT text=shape;
+        SIZE size={};
+        if(item.CtlID==SPEED && GetTextExtentPoint32W(dc,label,length,&size) &&
+           size.cx+scale(18)<=text.right-text.left){
+            text.right-=scale(10);
+            const int x=shape.right-scale(9),y=(shape.top+shape.bottom)/2;
+            POINT arrow[]={{x-scale(3),y-scale(1)},{x,y+scale(2)},{x+scale(3),y-scale(1)}};
+            SetDCPenColor(dc,ui::secondary);
+            Polyline(dc,arrow,static_cast<int>(std::size(arrow)));
+        }
+        DrawTextW(dc,label,length,&text,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
+        RestoreDC(dc,saved);
+    }
     void close(){if(closing)return;capture_diagnostics("before-close");trace_event("window-close");if(player.initialized())state=player.snapshot();save_safely();closing=true;cancel_jobs();unregister_keys();KillTimer(window,1);player.shutdown();if(trayAdded)Shell_NotifyIconW(NIM_DELETE,&tray);DestroyWindow(window);}
 };
 LRESULT CALLBACK window_proc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){App* app=reinterpret_cast<App*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));if(msg==WM_NCCREATE){app=static_cast<App*>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams);SetWindowLongPtrW(hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(app));app->window=hwnd;}if(!app)return DefWindowProcW(hwnd,msg,w,l);try{
@@ -577,8 +844,15 @@ LRESULT CALLBACK window_proc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){App* app=rein
     case WM_CREATE:app->init();return 0;
     case WM_ERASEBKGND:return 1;
     case WM_PAINT:app->paint();return 0;
-    case WM_DRAWITEM:app->draw_button(reinterpret_cast<DRAWITEMSTRUCT*>(l));return TRUE;
-    case WM_CTLCOLORSTATIC:{HDC dc=reinterpret_cast<HDC>(w);SetTextColor(dc,RGB(183,194,204));SetBkColor(dc,RGB(21,25,31));SetDCBrushColor(dc,RGB(21,25,31));return reinterpret_cast<LRESULT>(GetStockObject(DC_BRUSH));}
+    case WM_DRAWITEM:app->draw_button(*reinterpret_cast<DRAWITEMSTRUCT*>(l));return TRUE;
+    case WM_CTLCOLORSTATIC:{
+        HDC dc=reinterpret_cast<HDC>(w);
+        const auto background=reinterpret_cast<HWND>(l)==app->statusLabel?ui::chrome:ui::canvas;
+        SetTextColor(dc,ui::secondary);
+        SetBkColor(dc,background);
+        SetDCBrushColor(dc,background);
+        return reinterpret_cast<LRESULT>(GetStockObject(DC_BRUSH));
+    }
     case WM_SIZE:app->layout();return 0;
     case WM_NCHITTEST:{
         auto hit=DefWindowProcW(hwnd,msg,w,l);
@@ -593,7 +867,7 @@ LRESULT CALLBACK window_proc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){App* app=rein
     case WM_SIZING:{if(!app->resizeScreen)app->resizeScreen=app->screen_area();app->resizing=true;app->constrain_size(static_cast<UINT>(w),*reinterpret_cast<RECT*>(l),&*app->resizeScreen);return TRUE;}
     case WM_EXITSIZEMOVE:app->refresh_frame_insets();app->keep_on_screen();app->resizing=false;app->resizeScreen.reset();app->save_safely();return 0;
     case WM_DPICHANGED:{
-        app->dpi=HIWORD(w);app->top=app->settings.menu_bar_visible?app->scale(34):0;app->bottom=app->scale(25);app->set_font();RECT r=*reinterpret_cast<RECT*>(l);
+        app->dpi=HIWORD(w);app->top=app->settings.menu_bar_visible?app->scale(TOOLBAR_HEIGHT):0;app->bottom=app->scale(STATUS_HEIGHT);app->set_font();RECT r=*reinterpret_cast<RECT*>(l);
         RECT destination=app->resizing && app->resizeScreen?*app->resizeScreen:app->screen_area(&r);
         if(app->resizing && app->resizeScreen)app->constrain_size(WMSZ_BOTTOMRIGHT,r,&*app->resizeScreen);
         else if(!app->resizeScreen)app->fit_rect(r,destination);
